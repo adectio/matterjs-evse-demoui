@@ -1,0 +1,269 @@
+import { Environment, Seconds } from "@matter/main";
+import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
+import { EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
+import { isValidPasscode, ManualPairingCodeCodec, NodeId, QrPairingCodeCodec } from "@matter/main/types";
+import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
+
+export type CommissionedNode = {
+    nodeId: string;
+    commissionedAt?: string;
+};
+
+export type CommissionableDevice = {
+    id: string;
+    discriminator: number;
+    deviceName?: string;
+    deviceType?: number;
+};
+
+export type EvseStatus = {
+    nodeId: string;
+    endpointId: number;
+    state: number | null;
+    supplyState: number | null;
+    faultState: number | null;
+    chargingEnabledUntil: number | null;
+    circuitCapacity: number | null;
+    minimumChargeCurrent: number | null;
+    maximumChargeCurrent: number | null;
+    sessionId: number | null;
+    sessionDuration: number | null;
+    sessionEnergyCharged: number | null;
+    nextChargeStartTime: number | null;
+    nextChargeTargetTime: number | null;
+    nextChargeRequiredEnergy: number | null;
+    nextChargeTargetSoC: number | null;
+};
+
+type PairingDetails = {
+    passcode: number;
+    identifierData: { longDiscriminator: number } | { shortDiscriminator: number };
+};
+
+export class MatterControllerService {
+    #controller: CommissioningController | undefined;
+    #evseChangeListeners = new Set<() => void>();
+    #subscribedNodeIds = new Set<string>();
+
+    async start() {
+        if (this.#controller !== undefined) return;
+
+        const controller = new CommissioningController({
+            environment: {
+                environment: Environment.default,
+                id: "matter-evse-demo-controller",
+            },
+            adminFabricLabel: "Matter EVSE Demo",
+            autoConnect: false,
+        });
+
+        await controller.start();
+        this.#controller = controller;
+    }
+
+    listNodes(): CommissionedNode[] {
+        return this.controller.getCommissionedNodes().map(nodeId => ({ nodeId: nodeId.toString() }));
+    }
+
+    async discoverCommissionableDevices(): Promise<CommissionableDevice[]> {
+        const devices = await this.controller.discoverCommissionableDevices(
+            {},
+            { onIpNetwork: true },
+            undefined,
+            Seconds(10),
+        );
+        return devices.map(device => ({
+            id: device.deviceIdentifier,
+            discriminator: device.D,
+            deviceName: device.DN,
+            deviceType: device.DT,
+        }));
+    }
+
+    async commission(pairingCode: string, discriminator?: string): Promise<CommissionedNode> {
+        const pairing = parsePairingCode(pairingCode, discriminator);
+        const options: NodeCommissioningOptions = {
+            commissioning: {
+                regulatoryLocation: GeneralCommissioning.RegulatoryLocationType.IndoorOutdoor,
+                regulatoryCountryCode: "GB",
+            },
+            discovery: {
+                identifierData: pairing.identifierData,
+                discoveryCapabilities: { onIpNetwork: true },
+                timeout: Seconds(30),
+            },
+            passcode: pairing.passcode,
+        };
+
+        const nodeId = await this.controller.commissionNode(options, { connectNodeAfterCommissioning: false });
+        return { nodeId: nodeId.toString() };
+    }
+
+    async getEvseStatuses(selectedNodeId?: string): Promise<EvseStatus[]> {
+        const nodeIds = this.controller.getCommissionedNodes();
+        const selectedNode = selectedNodeId === undefined ? undefined : parseNodeId(selectedNodeId);
+        if (selectedNode !== undefined && !nodeIds.includes(selectedNode)) {
+            throw new Error("The selected Matter node is not commissioned in this controller.");
+        }
+
+        const statuses: EvseStatus[] = [];
+        for (const nodeId of nodeIds) {
+            if (selectedNode !== undefined && nodeId !== selectedNode) continue;
+            const node = await this.controller.getNode(nodeId);
+            this.subscribeToEvseChanges(node, nodeId.toString());
+            if (!(await ensureConnected(node))) continue;
+
+            for (const endpoint of node.node.endpoints) {
+                const state = endpoint.maybeStateOf(EnergyEvseClient);
+                if (state === undefined) continue;
+                statuses.push({
+                    nodeId: nodeId.toString(),
+                    endpointId: endpoint.number,
+                    state: numberOrNull(state.state),
+                    supplyState: numberOrNull(state.supplyState),
+                    faultState: numberOrNull(state.faultState),
+                    chargingEnabledUntil: numberOrNull(state.chargingEnabledUntil),
+                    circuitCapacity: numberOrNull(state.circuitCapacity),
+                    minimumChargeCurrent: numberOrNull(state.minimumChargeCurrent),
+                    maximumChargeCurrent: numberOrNull(state.maximumChargeCurrent),
+                    sessionId: numberOrNull(state.sessionId),
+                    sessionDuration: numberOrNull(state.sessionDuration),
+                    sessionEnergyCharged: numberOrNull(state.sessionEnergyCharged),
+                    nextChargeStartTime: numberOrNull(state.nextChargeStartTime),
+                    nextChargeTargetTime: numberOrNull(state.nextChargeTargetTime),
+                    nextChargeRequiredEnergy: numberOrNull(state.nextChargeRequiredEnergy),
+                    nextChargeTargetSoC: numberOrNull(state.nextChargeTargetSoC),
+                });
+            }
+        }
+        return statuses;
+    }
+
+    onEvseChanged(listener: () => void) {
+        this.#evseChangeListeners.add(listener);
+        return () => this.#evseChangeListeners.delete(listener);
+    }
+
+    async decommission(nodeId: string) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error(
+                "Could not connect to the device within 30 seconds. Remote decommission was not sent; use Force forget only if you accept that the device will retain this fabric.",
+            );
+        }
+        await node.decommission();
+    }
+
+    async openCommissioningWindow(nodeId: string) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the device within 30 seconds. The commissioning window was not opened.");
+        }
+        return node.openEnhancedCommissioningWindow(900);
+    }
+
+    async forceForget(nodeId: string) {
+        await this.controller.removeNode(parseNodeId(nodeId), false);
+        this.#subscribedNodeIds.delete(nodeId);
+    }
+
+    async cleanLocalContext() {
+        const controller = this.controller;
+        await controller.close();
+        await controller.resetStorage();
+        this.#controller = undefined;
+        await this.start();
+    }
+
+    async close() {
+        await this.#controller?.close();
+        this.#controller = undefined;
+        this.#subscribedNodeIds.clear();
+    }
+
+    get controller() {
+        if (this.#controller === undefined) {
+            throw new Error("Matter controller has not been started");
+        }
+        return this.#controller;
+    }
+
+    private subscribeToEvseChanges(node: Awaited<ReturnType<CommissioningController["getNode"]>>, nodeId: string) {
+        if (this.#subscribedNodeIds.has(nodeId)) return;
+        node.events.attributeChanged.on(({ path }) => {
+            if (path.clusterId === EnergyEvseCluster.id) {
+                for (const listener of this.#evseChangeListeners) listener();
+            }
+        });
+        this.#subscribedNodeIds.add(nodeId);
+    }
+}
+
+function parsePairingCode(input: string, suppliedDiscriminator?: string): PairingDetails {
+    const pairingCode = input.trim().replace(/\s/g, "");
+    if (pairingCode.length === 0) {
+        throw new Error("Enter a Matter QR code, manual pairing code, or setup PIN.");
+    }
+
+    if (pairingCode.toUpperCase().startsWith("MT:")) {
+        const decoded = QrPairingCodeCodec.decode(pairingCode)[0];
+        if (decoded === undefined) {
+            throw new Error("The Matter QR code did not contain a commissioning payload.");
+        }
+        return { identifierData: { longDiscriminator: decoded.discriminator }, passcode: decoded.passcode };
+    }
+
+    if (/^\d{1,8}$/.test(pairingCode)) {
+        const passcode = Number(pairingCode);
+        if (!isValidPasscode(passcode)) {
+            throw new Error("Enter a valid Matter setup PIN.");
+        }
+        return {
+            identifierData: { longDiscriminator: parseLongDiscriminator(suppliedDiscriminator) },
+            passcode,
+        };
+    }
+
+    const decoded = ManualPairingCodeCodec.decode(pairingCode);
+    if (decoded.discriminator !== undefined) {
+        return { identifierData: { longDiscriminator: decoded.discriminator }, passcode: decoded.passcode };
+    }
+    if (decoded.shortDiscriminator === undefined) {
+        throw new Error("The manual pairing code did not contain a discriminator.");
+    }
+    return { identifierData: { shortDiscriminator: decoded.shortDiscriminator }, passcode: decoded.passcode };
+}
+
+function parseLongDiscriminator(value: string | undefined) {
+    if (value === undefined || !/^\d+$/.test(value)) {
+        throw new Error("A 0–4095 long discriminator is required when entering a setup PIN.");
+    }
+    const discriminator = Number(value);
+    if (!Number.isSafeInteger(discriminator) || discriminator < 0 || discriminator > 4095) {
+        throw new Error("The long discriminator must be a whole number from 0 to 4095.");
+    }
+    return discriminator;
+}
+
+function parseNodeId(nodeId: string) {
+    if (!/^\d+$/.test(nodeId)) {
+        throw new Error("Invalid Matter node ID.");
+    }
+    return NodeId(nodeId);
+}
+
+function numberOrNull(value: number | bigint | null | undefined) {
+    return value === null || value === undefined ? null : Number(value);
+}
+
+async function ensureConnected(node: Awaited<ReturnType<CommissioningController["getNode"]>>) {
+    if (node.isConnected) return true;
+
+    node.connect({ autoSubscribe: true });
+    const deadline = Date.now() + 30_000;
+    while (!node.isConnected && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    return node.isConnected;
+}

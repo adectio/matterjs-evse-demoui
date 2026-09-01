@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Matter EVSE Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Adectio home">
+        <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
+      </a>
+      <nav aria-label="Main navigation"><a class="active" href="/">Admin</a><a href="/evse.html">EVSE</a></nav>
+    </aside>
+    <main>
+      <header>
+        <p class="eyebrow">MATTER 1.5 EVSE DEMO</p>
+        <h1>Commission and manage devices</h1>
+        <p class="muted">Initial commissioning supports Matter devices already reachable on the local IP network.</p>
+      </header>
+
+      <section class="card">
+        <h2>Commission new device</h2>
+        <form id="commission-form">
+          <label for="pairing-code">Matter QR, manual pairing code, or setup PIN</label>
+          <input id="pairing-code" name="pairing-code" autocomplete="off" placeholder="MT:... or 20202021" required />
+          <label for="discriminator">Long discriminator (required with setup PIN)</label>
+          <input id="discriminator" name="discriminator" inputmode="numeric" autocomplete="off" min="0" max="4095" placeholder="0–4095" />
+          <button type="submit">Commission device</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <h2>Commissionable devices</h2>
+          <button id="discover" class="secondary">Find devices</button>
+        </div>
+        <p id="discovery-empty-state" class="muted">Select “Find devices” to scan the local network for 10 seconds.</p>
+        <ul id="discovery-list"></ul>
+        <output id="discovery-status" aria-live="polite"></output>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <h2>Commissioned devices</h2>
+          <button id="refresh" class="secondary">Refresh</button>
+        </div>
+        <p id="empty-state" class="muted">No devices have been commissioned.</p>
+        <ul id="device-list"></ul>
+      </section>
+
+      <section id="commissioning-window" class="card" hidden>
+        <h2>Enhanced commissioning window</h2>
+        <p class="muted">Use either generated code with a second Matter commissioner. This window expires after 15 minutes.</p>
+        <div id="window-qr-image" class="qr-code" role="img" aria-label="Enhanced commissioning QR code"></div>
+        <label>QR payload <code id="window-qr-code"></code></label>
+        <label>Manual pairing code <code id="window-manual-code"></code></label>
+      </section>
+
+      <section class="card danger">
+        <h2>Clean local context</h2>
+        <p>Erases this app's locally stored Matter fabric and node history. It does not remove this fabric from devices.</p>
+        <button id="clean-context" class="danger-button">Clean local context</button>
+      </section>
+
+      <output id="status" aria-live="polite"></output>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

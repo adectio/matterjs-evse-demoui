@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EVSE | Matter EVSE Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Adectio home">
+        <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
+      </a>
+      <nav aria-label="Main navigation"><a href="/">Admin</a><a class="active" href="/evse.html">EVSE</a></nav>
+    </aside>
+    <main>
+      <header>
+        <p class="eyebrow">MATTER 1.5 EVSE DEMO</p>
+        <div class="section-heading">
+          <div><h1>EV charger</h1><p class="muted">Live state from subscribed Energy EVSE attributes.</p></div>
+          <span class="badge good">Live</span>
+        </div>
+      </header>
+      <section class="card node-selector">
+        <label for="node-select">Matter node</label>
+        <select id="node-select" disabled>
+          <option>Loading commissioned nodes…</option>
+        </select>
+      </section>
+      <p id="empty-state" class="muted">No reachable Energy EVSE endpoint has been discovered yet.</p>
+      <div id="evse-list"></div>
+      <output id="status" aria-live="polite"></output>
+    </main>
+    <script type="module" src="/evse.js"></script>
+  </body>
+</html>
