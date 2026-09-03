@@ -56,6 +56,21 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
         return;
     }
 
+    const evseAction = /^\/api\/evses\/(\d+)\/(\d+)\/toggle-charging$/.exec(url.pathname);
+    if (request.method === "POST" && evseAction !== null) {
+        const [, nodeId, endpointId] = evseAction;
+        const body = await readJson(request);
+        sendJson(response, 200, {
+            status: await controller.toggleCharging(
+                nodeId,
+                endpointId,
+                requiredChargeCurrent(body.minimumChargeCurrent, "minimumChargeCurrent"),
+                requiredChargeCurrent(body.maximumChargeCurrent, "maximumChargeCurrent"),
+            ),
+        });
+        return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/discover") {
         const devices = await controller.discoverCommissionableDevices();
         sendJson(response, 200, { devices });
@@ -162,6 +177,13 @@ function requiredString(value: unknown, name: string) {
 function optionalString(value: unknown) {
     if (value === undefined) return undefined;
     if (typeof value !== "string") throw new Error('"discriminator" must be a string.');
+    return value;
+}
+
+function requiredChargeCurrent(value: unknown, name: string) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+        throw new Error(`"${name}" must be a whole number of milliamps.`);
+    }
     return value;
 }
 

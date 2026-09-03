@@ -50,10 +50,21 @@ The **Admin** page handles commissioning and fabric lifecycle. The **EVSE**
 page discovers every reachable endpoint exposing the Energy EVSE cluster and
 shows its main state, connection/charging status, session telemetry, and
 device-reported next charging preferences. It subscribes to Energy EVSE
-attribute changes and updates automatically; fields unavailable on a device
-are shown as unavailable rather than inferred. Select the commissioned Matter
-node to control/view from the **Matter node** selector; the browser remembers
-that selection.
+attribute changes and Electrical Power Measurement (EPM) updates
+automatically. Its EPM meter shows active power, voltage, and current when
+that cluster is present on the EVSE endpoint or its Descriptor-derived parts;
+when one EPM endpoint exists elsewhere on the node, it is used as the meter.
+The displayed meter heading identifies its endpoint. Fields unavailable on a
+device are shown as unavailable rather than inferred. Select the commissioned
+Matter node to control/view from the **Matter node** selector; the browser
+remembers that selection.
+
+The EVSE page provides an **Enable charging** / **Disable charging** control.
+When enabling, enter the minimum and maximum charge current in milliamps. The form
+defaults the maximum to the reported circuit capacity, rather than the current
+maximum charge current, because a disabled EVSE reports the latter as zero.
+The demo validates a 6 A minimum and does not allow a requested maximum above
+the device's reported circuit capacity before sending the timed EVSE command.
 
 The Matter fabric and commissioned-node records are managed by Matter.js in
 its local storage. Do not delete its storage directly while the app is

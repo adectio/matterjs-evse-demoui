@@ -1,6 +1,7 @@
 import { Environment, Seconds } from "@matter/main";
+import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
-import { EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
+import { ElectricalPowerMeasurementCluster, EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
 import { isValidPasscode, ManualPairingCodeCodec, NodeId, QrPairingCodeCodec } from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
 
@@ -33,6 +34,10 @@ export type EvseStatus = {
     nextChargeTargetTime: number | null;
     nextChargeRequiredEnergy: number | null;
     nextChargeTargetSoC: number | null;
+    powerMeterEndpointId: number | null;
+    activePower: number | null;
+    voltage: number | null;
+    activeCurrent: number | null;
 };
 
 type PairingDetails = {
@@ -113,9 +118,17 @@ export class MatterControllerService {
             this.subscribeToEvseChanges(node, nodeId.toString());
             if (!(await ensureConnected(node))) continue;
 
-            for (const endpoint of node.node.endpoints) {
+            const endpoints = [...node.node.endpoints];
+            const powerMeterEndpoints = endpoints.filter(
+                endpoint => endpoint.maybeStateOf(ElectricalPowerMeasurementClient) !== undefined,
+            );
+            for (const endpoint of endpoints) {
                 const state = endpoint.maybeStateOf(EnergyEvseClient);
                 if (state === undefined) continue;
+                const powerMeterEndpoint =
+                    powerMeterEndpoints.find(candidate => candidate === endpoint || isDescendantOf(candidate, endpoint)) ??
+                    (powerMeterEndpoints.length === 1 ? powerMeterEndpoints[0] : undefined);
+                const powerMeasurement = powerMeterEndpoint?.maybeStateOf(ElectricalPowerMeasurementClient);
                 statuses.push({
                     nodeId: nodeId.toString(),
                     endpointId: endpoint.number,
@@ -133,6 +146,10 @@ export class MatterControllerService {
                     nextChargeTargetTime: numberOrNull(state.nextChargeTargetTime),
                     nextChargeRequiredEnergy: numberOrNull(state.nextChargeRequiredEnergy),
                     nextChargeTargetSoC: numberOrNull(state.nextChargeTargetSoC),
+                    powerMeterEndpointId: powerMeterEndpoint === undefined ? null : Number(powerMeterEndpoint.number),
+                    activePower: numberOrNull(powerMeasurement?.activePower),
+                    voltage: numberOrNull(powerMeasurement?.voltage),
+                    activeCurrent: numberOrNull(powerMeasurement?.activeCurrent),
                 });
             }
         }
@@ -152,6 +169,50 @@ export class MatterControllerService {
             );
         }
         await node.decommission();
+    }
+
+    async toggleCharging(nodeId: string, endpointId: string, minimumChargeCurrent: number, maximumChargeCurrent: number) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the EVSE within 30 seconds. No charging command was sent.");
+        }
+
+        const parsedEndpointId = Number(endpointId);
+        if (!Number.isSafeInteger(parsedEndpointId) || parsedEndpointId < 0) {
+            throw new Error("Invalid EVSE endpoint ID.");
+        }
+        const endpoint = [...node.node.endpoints].find(candidate => candidate.number === parsedEndpointId);
+        const state = endpoint?.maybeStateOf(EnergyEvseClient);
+        if (endpoint === undefined || state === undefined) {
+            throw new Error("The selected endpoint does not expose the Energy EVSE cluster.");
+        }
+
+        const chargingOrDischargingEnabled = [1, 2, 5].includes(Number(state.supplyState));
+        if (chargingOrDischargingEnabled) {
+            await endpoint.act("disable EVSE charging", agent => agent.get(EnergyEvseClient).disable());
+            return "Charging and discharging disabled.";
+        }
+
+        if (minimumChargeCurrent < 6_000) {
+            throw new Error("Minimum charge current must be at least 6 A.");
+        }
+        if (maximumChargeCurrent < minimumChargeCurrent) {
+            throw new Error("Maximum charge current must be greater than or equal to the minimum.");
+        }
+
+        const circuitCapacity = numberOrNull(state.circuitCapacity);
+        if (circuitCapacity !== null && maximumChargeCurrent > circuitCapacity) {
+            throw new Error(`Maximum charge current cannot exceed the device circuit capacity of ${circuitCapacity / 1_000} A.`);
+        }
+
+        await endpoint.act("enable EVSE charging", agent =>
+            agent.get(EnergyEvseClient).enableCharging({
+                chargingEnabledUntil: null,
+                minimumChargeCurrent,
+                maximumChargeCurrent,
+            }),
+        );
+        return `Charging enabled from ${minimumChargeCurrent / 1_000} A to ${maximumChargeCurrent / 1_000} A.`;
     }
 
     async openCommissioningWindow(nodeId: string) {
@@ -191,7 +252,7 @@ export class MatterControllerService {
     private subscribeToEvseChanges(node: Awaited<ReturnType<CommissioningController["getNode"]>>, nodeId: string) {
         if (this.#subscribedNodeIds.has(nodeId)) return;
         node.events.attributeChanged.on(({ path }) => {
-            if (path.clusterId === EnergyEvseCluster.id) {
+            if (path.clusterId === EnergyEvseCluster.id || path.clusterId === ElectricalPowerMeasurementCluster.id) {
                 for (const listener of this.#evseChangeListeners) listener();
             }
         });
@@ -254,6 +315,15 @@ function parseNodeId(nodeId: string) {
 
 function numberOrNull(value: number | bigint | null | undefined) {
     return value === null || value === undefined ? null : Number(value);
+}
+
+function isDescendantOf(candidate: { owner?: unknown }, ancestor: object) {
+    let current = candidate.owner;
+    while (current !== undefined) {
+        if (current === ancestor) return true;
+        current = (current as { owner?: unknown }).owner;
+    }
+    return false;
 }
 
 async function ensureConnected(node: Awaited<ReturnType<CommissioningController["getNode"]>>) {

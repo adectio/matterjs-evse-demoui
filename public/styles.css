@@ -48,8 +48,18 @@ output.error { color: #c0263d; }
 h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75rem; padding-top: 1.25rem; text-transform: uppercase; letter-spacing: .07em; }
 .metrics { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0; }
 .metrics div { background: #f8fbff; border-radius: 8px; padding: .75rem; }
+.metrics div.good { background: #e8f7ed; color: #146c2e; }
+.metrics div.neutral { background: #eef1f5; color: #526174; }
+.metrics div.warning { background: #fff0dc; color: #a45100; }
 .metrics dt { color: var(--muted); font-size: .8rem; }
+.metrics div.good dt { color: #287a3e; }
+.metrics div.neutral dt { color: #607080; }
+.metrics div.warning dt { color: #a45100; }
 .metrics dd { font-size: 1rem; font-weight: 650; margin: .3rem 0 0; }
+.charging-control { margin-top: 1.25rem; }
+.charging-controls { align-items: end; grid-template-columns: repeat(2, minmax(0, 1fr)) auto; margin-top: 1.25rem; }
+.charging-controls label { display: grid; gap: .3rem; }
+.charging-controls button { height: fit-content; }
 .node-selector { display: grid; gap: .5rem; }
 #commissioning-window { display: grid; gap: .75rem; }
 #commissioning-window label { display: grid; gap: .3rem; }
@@ -63,4 +73,5 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
   nav { display: flex; }
   nav a { padding: .45rem .65rem; }
   main { margin: 0; padding: 2rem 1rem; }
+  .charging-controls { grid-template-columns: 1fr; }
 }
