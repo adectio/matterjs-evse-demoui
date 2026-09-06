@@ -1,6 +1,7 @@
 import { Environment, Seconds } from "@matter/main";
+import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
-import { EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
+import { ElectricalPowerMeasurementCluster, EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
 import { isValidPasscode, ManualPairingCodeCodec, NodeId, QrPairingCodeCodec } from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
 
@@ -33,6 +34,33 @@ export type EvseStatus = {
     nextChargeTargetTime: number | null;
     nextChargeRequiredEnergy: number | null;
     nextChargeTargetSoC: number | null;
+    powerMeterEndpointId: number | null;
+    activePower: number | null;
+    voltage: number | null;
+    activeCurrent: number | null;
+};
+
+export type ChargingTargetView = {
+    departureMinutes: number;
+    targetSoC: number | null;
+    addedEnergy: number | null;
+};
+
+export type ChargingTargetScheduleView = {
+    days: string[];
+    targets: ChargingTargetView[];
+};
+
+export type ChargingPreferences = {
+    supportsSoC: boolean;
+    approximateEvEfficiency: number | null;
+    schedules: ChargingTargetScheduleView[];
+};
+
+export type ChargingTargetInput = {
+    departureMinutes: number;
+    targetSoC?: number;
+    addedEnergy?: number;
 };
 
 type PairingDetails = {
@@ -113,9 +141,17 @@ export class MatterControllerService {
             this.subscribeToEvseChanges(node, nodeId.toString());
             if (!(await ensureConnected(node))) continue;
 
-            for (const endpoint of node.node.endpoints) {
+            const endpoints = [...node.node.endpoints];
+            const powerMeterEndpoints = endpoints.filter(
+                endpoint => endpoint.maybeStateOf(ElectricalPowerMeasurementClient) !== undefined,
+            );
+            for (const endpoint of endpoints) {
                 const state = endpoint.maybeStateOf(EnergyEvseClient);
                 if (state === undefined) continue;
+                const powerMeterEndpoint =
+                    powerMeterEndpoints.find(candidate => candidate === endpoint || isDescendantOf(candidate, endpoint)) ??
+                    (powerMeterEndpoints.length === 1 ? powerMeterEndpoints[0] : undefined);
+                const powerMeasurement = powerMeterEndpoint?.maybeStateOf(ElectricalPowerMeasurementClient);
                 statuses.push({
                     nodeId: nodeId.toString(),
                     endpointId: endpoint.number,
@@ -133,6 +169,10 @@ export class MatterControllerService {
                     nextChargeTargetTime: numberOrNull(state.nextChargeTargetTime),
                     nextChargeRequiredEnergy: numberOrNull(state.nextChargeRequiredEnergy),
                     nextChargeTargetSoC: numberOrNull(state.nextChargeTargetSoC),
+                    powerMeterEndpointId: powerMeterEndpoint === undefined ? null : Number(powerMeterEndpoint.number),
+                    activePower: numberOrNull(powerMeasurement?.activePower),
+                    voltage: numberOrNull(powerMeasurement?.voltage),
+                    activeCurrent: numberOrNull(powerMeasurement?.activeCurrent),
                 });
             }
         }
@@ -152,6 +192,119 @@ export class MatterControllerService {
             );
         }
         await node.decommission();
+    }
+
+    async toggleCharging(nodeId: string, endpointId: string, minimumChargeCurrent: number, maximumChargeCurrent: number) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the EVSE within 30 seconds. No charging command was sent.");
+        }
+
+        const parsedEndpointId = Number(endpointId);
+        if (!Number.isSafeInteger(parsedEndpointId) || parsedEndpointId < 0) {
+            throw new Error("Invalid EVSE endpoint ID.");
+        }
+        const endpoint = [...node.node.endpoints].find(candidate => candidate.number === parsedEndpointId);
+        const state = endpoint?.maybeStateOf(EnergyEvseClient);
+        if (endpoint === undefined || state === undefined) {
+            throw new Error("The selected endpoint does not expose the Energy EVSE cluster.");
+        }
+
+        const chargingOrDischargingEnabled = [1, 2, 5].includes(Number(state.supplyState));
+        if (chargingOrDischargingEnabled) {
+            await endpoint.act("disable EVSE charging", agent => agent.get(EnergyEvseClient).disable());
+            return "Charging and discharging disabled.";
+        }
+
+        if (minimumChargeCurrent < 6_000) {
+            throw new Error("Minimum charge current must be at least 6 A.");
+        }
+        if (maximumChargeCurrent < minimumChargeCurrent) {
+            throw new Error("Maximum charge current must be greater than or equal to the minimum.");
+        }
+
+        const circuitCapacity = numberOrNull(state.circuitCapacity);
+        if (circuitCapacity !== null && maximumChargeCurrent > circuitCapacity) {
+            throw new Error(`Maximum charge current cannot exceed the device circuit capacity of ${circuitCapacity / 1_000} A.`);
+        }
+
+        await endpoint.act("enable EVSE charging", agent =>
+            agent.get(EnergyEvseClient).enableCharging({
+                chargingEnabledUntil: null,
+                minimumChargeCurrent,
+                maximumChargeCurrent,
+            }),
+        );
+        return `Charging enabled from ${minimumChargeCurrent / 1_000} A to ${maximumChargeCurrent / 1_000} A.`;
+    }
+
+    async getChargingPreferences(nodeId: string, endpointId: string): Promise<ChargingPreferences> {
+        const { endpoint, state } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        const response = await endpoint.act("get EVSE charging targets", agent => agent.get(EnergyEvseClient).getTargets());
+        return {
+            supportsSoC: endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true,
+            approximateEvEfficiency: numberOrNull(state.approximateEvEfficiency),
+            schedules: response.chargingTargetSchedules.map(schedule => ({
+                days: daysFromBitmap(schedule.dayOfWeekForSequence),
+                targets: schedule.chargingTargets.map(target => ({
+                    departureMinutes: target.targetTimeMinutesPastMidnight,
+                    targetSoC: numberOrNull(target.targetSoC),
+                    addedEnergy: numberOrNull(target.addedEnergy),
+                })),
+            })),
+        };
+    }
+
+    async setChargingTargets(
+        nodeId: string,
+        endpointId: string,
+        days: string[],
+        targets: ChargingTargetInput[],
+        approximateEvEfficiency?: number,
+    ) {
+        const { endpoint } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        if (days.length === 0) throw new Error("Select at least one day.");
+        if (targets.length === 0 || targets.length > 10) throw new Error("Add between one and ten charging targets.");
+        if (
+            endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true &&
+            targets.some(target => target.targetSoC === undefined)
+        ) {
+            throw new Error("This SoC-reporting EVSE requires a target SoC for every charging target.");
+        }
+        if (approximateEvEfficiency !== undefined) {
+            await endpoint.setStateOf(EnergyEvseClient, { approximateEvEfficiency });
+        }
+
+        await endpoint.act("set EVSE charging targets", agent =>
+            agent.get(EnergyEvseClient).setTargets({
+                chargingTargetSchedules: [
+                    {
+                        dayOfWeekForSequence: bitmapFromDays(days),
+                        chargingTargets: targets.map(target => ({
+                            targetTimeMinutesPastMidnight: target.departureMinutes,
+                            targetSoC: target.targetSoC,
+                            addedEnergy: target.addedEnergy,
+                        })),
+                    },
+                ],
+            }),
+        );
+        return this.getChargingPreferences(nodeId, endpointId);
+    }
+
+    async clearChargingTargets(nodeId: string, endpointId: string) {
+        const { endpoint } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        await endpoint.act("clear EVSE charging targets", agent => agent.get(EnergyEvseClient).clearTargets());
+        return this.getChargingPreferences(nodeId, endpointId);
     }
 
     async openCommissioningWindow(nodeId: string) {
@@ -191,11 +344,28 @@ export class MatterControllerService {
     private subscribeToEvseChanges(node: Awaited<ReturnType<CommissioningController["getNode"]>>, nodeId: string) {
         if (this.#subscribedNodeIds.has(nodeId)) return;
         node.events.attributeChanged.on(({ path }) => {
-            if (path.clusterId === EnergyEvseCluster.id) {
+            if (path.clusterId === EnergyEvseCluster.id || path.clusterId === ElectricalPowerMeasurementCluster.id) {
                 for (const listener of this.#evseChangeListeners) listener();
             }
         });
         this.#subscribedNodeIds.add(nodeId);
+    }
+
+    private async getEvseEndpoint(nodeId: string, endpointId: string) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the EVSE within 30 seconds.");
+        }
+        const parsedEndpointId = Number(endpointId);
+        if (!Number.isSafeInteger(parsedEndpointId) || parsedEndpointId < 0) {
+            throw new Error("Invalid EVSE endpoint ID.");
+        }
+        const endpoint = [...node.node.endpoints].find(candidate => candidate.number === parsedEndpointId);
+        const state = endpoint?.maybeStateOf(EnergyEvseClient);
+        if (endpoint === undefined || state === undefined) {
+            throw new Error("The selected endpoint does not expose the Energy EVSE cluster.");
+        }
+        return { endpoint, state };
     }
 }
 
@@ -254,6 +424,35 @@ function parseNodeId(nodeId: string) {
 
 function numberOrNull(value: number | bigint | null | undefined) {
     return value === null || value === undefined ? null : Number(value);
+}
+
+function isDescendantOf(candidate: { owner?: unknown }, ancestor: object) {
+    let current = candidate.owner;
+    while (current !== undefined) {
+        if (current === ancestor) return true;
+        current = (current as { owner?: unknown }).owner;
+    }
+    return false;
+}
+
+const targetDays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+
+type TargetDay = (typeof targetDays)[number];
+type TargetDayBitmap = { [key in TargetDay]?: boolean };
+
+function bitmapFromDays(days: string[]): TargetDayBitmap {
+    const bitmap: TargetDayBitmap = {};
+    for (const day of days) {
+        if (!targetDays.includes(day as TargetDay)) {
+            throw new Error(`Invalid day "${day}".`);
+        }
+        bitmap[day as TargetDay] = true;
+    }
+    return bitmap;
+}
+
+function daysFromBitmap(bitmap: TargetDayBitmap) {
+    return targetDays.filter(day => bitmap[day] === true);
 }
 
 async function ensureConnected(node: Awaited<ReturnType<CommissioningController["getNode"]>>) {
