@@ -40,6 +40,29 @@ export type EvseStatus = {
     activeCurrent: number | null;
 };
 
+export type ChargingTargetView = {
+    departureMinutes: number;
+    targetSoC: number | null;
+    addedEnergy: number | null;
+};
+
+export type ChargingTargetScheduleView = {
+    days: string[];
+    targets: ChargingTargetView[];
+};
+
+export type ChargingPreferences = {
+    supportsSoC: boolean;
+    approximateEvEfficiency: number | null;
+    schedules: ChargingTargetScheduleView[];
+};
+
+export type ChargingTargetInput = {
+    departureMinutes: number;
+    targetSoC?: number;
+    addedEnergy?: number;
+};
+
 type PairingDetails = {
     passcode: number;
     identifierData: { longDiscriminator: number } | { shortDiscriminator: number };
@@ -215,6 +238,75 @@ export class MatterControllerService {
         return `Charging enabled from ${minimumChargeCurrent / 1_000} A to ${maximumChargeCurrent / 1_000} A.`;
     }
 
+    async getChargingPreferences(nodeId: string, endpointId: string): Promise<ChargingPreferences> {
+        const { endpoint, state } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        const response = await endpoint.act("get EVSE charging targets", agent => agent.get(EnergyEvseClient).getTargets());
+        return {
+            supportsSoC: endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true,
+            approximateEvEfficiency: numberOrNull(state.approximateEvEfficiency),
+            schedules: response.chargingTargetSchedules.map(schedule => ({
+                days: daysFromBitmap(schedule.dayOfWeekForSequence),
+                targets: schedule.chargingTargets.map(target => ({
+                    departureMinutes: target.targetTimeMinutesPastMidnight,
+                    targetSoC: numberOrNull(target.targetSoC),
+                    addedEnergy: numberOrNull(target.addedEnergy),
+                })),
+            })),
+        };
+    }
+
+    async setChargingTargets(
+        nodeId: string,
+        endpointId: string,
+        days: string[],
+        targets: ChargingTargetInput[],
+        approximateEvEfficiency?: number,
+    ) {
+        const { endpoint } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        if (days.length === 0) throw new Error("Select at least one day.");
+        if (targets.length === 0 || targets.length > 10) throw new Error("Add between one and ten charging targets.");
+        if (
+            endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true &&
+            targets.some(target => target.targetSoC === undefined)
+        ) {
+            throw new Error("This SoC-reporting EVSE requires a target SoC for every charging target.");
+        }
+        if (approximateEvEfficiency !== undefined) {
+            await endpoint.setStateOf(EnergyEvseClient, { approximateEvEfficiency });
+        }
+
+        await endpoint.act("set EVSE charging targets", agent =>
+            agent.get(EnergyEvseClient).setTargets({
+                chargingTargetSchedules: [
+                    {
+                        dayOfWeekForSequence: bitmapFromDays(days),
+                        chargingTargets: targets.map(target => ({
+                            targetTimeMinutesPastMidnight: target.departureMinutes,
+                            targetSoC: target.targetSoC,
+                            addedEnergy: target.addedEnergy,
+                        })),
+                    },
+                ],
+            }),
+        );
+        return this.getChargingPreferences(nodeId, endpointId);
+    }
+
+    async clearChargingTargets(nodeId: string, endpointId: string) {
+        const { endpoint } = await this.getEvseEndpoint(nodeId, endpointId);
+        if (!endpoint.maybeFeaturesOf(EnergyEvseClient)?.chargingPreferences) {
+            throw new Error("This EVSE does not support charging preferences.");
+        }
+        await endpoint.act("clear EVSE charging targets", agent => agent.get(EnergyEvseClient).clearTargets());
+        return this.getChargingPreferences(nodeId, endpointId);
+    }
+
     async openCommissioningWindow(nodeId: string) {
         const node = await this.controller.getNode(parseNodeId(nodeId));
         if (!(await ensureConnected(node))) {
@@ -257,6 +349,23 @@ export class MatterControllerService {
             }
         });
         this.#subscribedNodeIds.add(nodeId);
+    }
+
+    private async getEvseEndpoint(nodeId: string, endpointId: string) {
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the EVSE within 30 seconds.");
+        }
+        const parsedEndpointId = Number(endpointId);
+        if (!Number.isSafeInteger(parsedEndpointId) || parsedEndpointId < 0) {
+            throw new Error("Invalid EVSE endpoint ID.");
+        }
+        const endpoint = [...node.node.endpoints].find(candidate => candidate.number === parsedEndpointId);
+        const state = endpoint?.maybeStateOf(EnergyEvseClient);
+        if (endpoint === undefined || state === undefined) {
+            throw new Error("The selected endpoint does not expose the Energy EVSE cluster.");
+        }
+        return { endpoint, state };
     }
 }
 
@@ -324,6 +433,26 @@ function isDescendantOf(candidate: { owner?: unknown }, ancestor: object) {
         current = (current as { owner?: unknown }).owner;
     }
     return false;
+}
+
+const targetDays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+
+type TargetDay = (typeof targetDays)[number];
+type TargetDayBitmap = { [key in TargetDay]?: boolean };
+
+function bitmapFromDays(days: string[]): TargetDayBitmap {
+    const bitmap: TargetDayBitmap = {};
+    for (const day of days) {
+        if (!targetDays.includes(day as TargetDay)) {
+            throw new Error(`Invalid day "${day}".`);
+        }
+        bitmap[day as TargetDay] = true;
+    }
+    return bitmap;
+}
+
+function daysFromBitmap(bitmap: TargetDayBitmap) {
+    return targetDays.filter(day => bitmap[day] === true);
 }
 
 async function ensureConnected(node: Awaited<ReturnType<CommissioningController["getNode"]>>) {

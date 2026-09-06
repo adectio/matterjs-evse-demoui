@@ -30,7 +30,7 @@ implemented.
 ## Quick start
 
 ```sh
-git clone <repository-url>
+git clone git@github.com:adectio/matterjs-evse-demoui.git
 cd matterjs-evse-demoui
 npm install
 npm run dev
@@ -65,6 +65,23 @@ defaults the maximum to the reported circuit capacity, rather than the current
 maximum charge current, because a disabled EVSE reports the latter as zero.
 The demo validates a 6 A minimum and does not allow a requested maximum above
 the device's reported circuit capacity before sending the timed EVSE command.
+
+## Charging preferences
+
+The **Charging preferences** page reads `GetTargets` automatically for the
+selected EVSE endpoint. Select one or more days, add up to ten departure
+targets, and choose either a target SoC or added driving range. The app sends
+one additive `SetTargets` schedule and immediately reads `GetTargets` again;
+the EVSE's returned schedules are the displayed source of truth.
+
+Range targets are converted to Matter `addedEnergy` in mWh. Enter vehicle
+efficiency as mi/kWh, km/kWh, or kWh/100 km; the app converts it to Matter's
+`ApproximateEVEfficiency` representation (km/kWh × 1000) before setting
+range-based targets. **Clear all targets** calls the EVSE `ClearTargets`
+command and then reads the result back. An EVSE that advertises SoC reporting
+requires `TargetSoC` in every target (as validated by the Matter reference
+server); the page therefore uses SoC targets for those EVSEs rather than
+sending an added-range target whose meaning would be overridden by SoC.
 
 The Matter fabric and commissioned-node records are managed by Matter.js in
 its local storage. Do not delete its storage directly while the app is
@@ -101,10 +118,3 @@ The app uses a Node.js backend because Matter fabrics, commissioning
 credentials, discovery, and multicast networking must not be held in browser
 code. The browser UI is served locally on loopback and calls the backend's
 small HTTP API.
-
-Read [ai/README.md](ai/README.md) for Matter/EVSE constraints and
-[ai/PLAN.md](ai/PLAN.md) for the staged roadmap toward EVSE telemetry,
-charging preferences, tariffs, and DEM-based EMS controls.
-
-The Adectio logo is stored locally at `public/assets/adectio-logo.png`, sourced
-from the [Adectio website](https://adectio.com/).

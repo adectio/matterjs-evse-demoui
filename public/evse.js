@@ -98,7 +98,7 @@ function renderEvse(evse) {
       <h3>Main status</h3>
       <dl class="metrics">
         ${metric("EV plugged in", isPluggedIn(evse.state) ? "Yes" : evse.state === null ? "Unavailable" : "No", isPluggedIn(evse.state) ? "good" : "neutral")}
-        ${metric("Charging", chargingLabel(evse.state), chargingStatus(evse.state))}
+        ${metric("Charging", chargingLabel(evse), chargingStatus(evse))}
         ${metric("Supply", supplyLabel(evse.supplyState))}
         ${metric("Fault", faultLabel(evse.faultState))}
         ${metric("Session energy", energy(evse.sessionEnergyCharged))}
@@ -244,15 +244,25 @@ function isPluggedIn(value) {
     return value !== null && value >= 1 && value <= 5;
 }
 
-function chargingLabel(value) {
-    if (value === 3) return "Charging";
-    if (value === 4) return "Discharging";
+function chargingLabel(evse) {
+    if (evse.activePower !== null) {
+        if (evse.activePower > 5_000) return "Charging";
+        if (evse.activePower < -5_000) return "Discharging";
+        return "Not charging";
+    }
+    if (evse.state === 3) return "Charging";
+    if (evse.state === 4) return "Discharging";
     return "Not charging";
 }
 
-function chargingStatus(value) {
-    if (value === 3) return "good";
-    if (value === 4) return "warning";
+function chargingStatus(evse) {
+    if (evse.activePower !== null) {
+        if (evse.activePower > 5_000) return "good";
+        if (evse.activePower < -5_000) return "warning";
+        return "neutral";
+    }
+    if (evse.state === 3) return "good";
+    if (evse.state === 4) return "warning";
     return "neutral";
 }
 
