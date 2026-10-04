@@ -109,15 +109,15 @@ stream.onerror = () => {
 };
 
 evseList.addEventListener("focusin", event => {
-    if (event.target.closest(".charging-controls")) {
+    if (event.target.closest(".evse-controls")) {
         chargingControlsActive = true;
     }
 });
 
 evseList.addEventListener("focusout", event => {
-    if (!event.target.closest(".charging-controls")) return;
+    if (!event.target.closest(".evse-controls")) return;
     setTimeout(() => {
-        if (evseList.contains(document.activeElement) && document.activeElement.closest(".charging-controls")) return;
+        if (evseList.contains(document.activeElement) && document.activeElement.closest(".evse-controls")) return;
         chargingControlsActive = false;
         if (refreshPending) {
             refreshPending = false;
@@ -144,6 +144,7 @@ function renderEvse(evse) {
         ${metric("Session energy", energy(evse.sessionEnergyCharged))}
         ${metric("Session duration", duration(evse.sessionDuration))}
         ${metric("Effective charge limit", effectiveChargeLimit(evse))}
+        ${metric("User charge limit", current(evse.userMaximumChargeCurrent))}
         ${metric("Circuit capacity", current(evse.circuitCapacity))}
       </dl>
       <h3>Power meter${evse.powerMeterEndpointId === null ? "" : ` · endpoint ${evse.powerMeterEndpointId}`}</h3>
@@ -161,6 +162,7 @@ function renderEvse(evse) {
         ${metric("Charging enabled until", chargingEnabledUntil(evse))}
       </dl>`;
 
+    card.append(createUserChargeLimitControls(evse));
     if (faultActive) {
         const message = document.createElement("p");
         message.className = "muted";
@@ -180,7 +182,7 @@ function renderEvse(evse) {
 
 function createChargingControls(evse) {
     const form = document.createElement("form");
-    form.className = "charging-controls";
+    form.className = "charging-controls evse-controls";
 
     const minimumInput = currentInput("Minimum current (mA)", defaultMinimumChargeCurrent(evse), 6_000);
     const maximumInput = currentInput("Maximum current", defaultMaximumChargeCurrent(evse, Number(minimumInput.value)), Number(minimumInput.value));
@@ -201,6 +203,82 @@ function createChargingControls(evse) {
         enableCharging(evse, control, Number(minimumInput.value), Number(maximumInput.value));
     });
     return form;
+}
+
+function createUserChargeLimitControls(evse) {
+    const container = document.createElement("section");
+    container.className = "user-current-limit";
+
+    const heading = document.createElement("h3");
+    heading.textContent = "User charge limit";
+    container.append(heading);
+
+    if (evse.circuitCapacity === null || evse.circuitCapacity < 0) {
+        const message = document.createElement("p");
+        message.className = "muted";
+        message.textContent = "A user charge limit can be set after the EVSE reports its circuit capacity.";
+        container.append(message);
+        return container;
+    }
+
+    const form = document.createElement("form");
+    form.className = "user-current-limit-controls evse-controls";
+    const label = document.createElement("label");
+    label.htmlFor = `user-current-limit-${evse.nodeId}-${evse.endpointId}`;
+    label.textContent = "Maximum current";
+    const range = document.createElement("input");
+    range.type = "range";
+    range.id = label.htmlFor;
+    range.min = "0";
+    range.max = String(evse.circuitCapacity);
+    range.step = "1000";
+    range.value = String(clampChargeCurrent(evse.userMaximumChargeCurrent, evse.circuitCapacity));
+    const value = document.createElement("output");
+    value.textContent = current(Number(range.value));
+    range.addEventListener("input", () => {
+        value.textContent = current(Number(range.value));
+    });
+
+    const control = document.createElement("button");
+    control.type = "submit";
+    control.textContent = "Apply limit";
+    form.append(label, range, value, control);
+    form.addEventListener("submit", event => {
+        event.preventDefault();
+        setUserChargeLimit(evse, control, Number(range.value));
+    });
+    container.append(form);
+    return container;
+}
+
+function clampChargeCurrent(value, maximum) {
+    if (!Number.isSafeInteger(value)) return maximum;
+    return Math.min(Math.max(value, 0), maximum);
+}
+
+async function setUserChargeLimit(evse, control, userMaximumChargeCurrent) {
+    control.disabled = true;
+    control.classList.add("is-busy");
+    status.textContent = "Updating user charge limit…";
+    try {
+        const response = await fetch(`/api/evses/${evse.nodeId}/${evse.endpointId}/user-maximum-charge-current`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ userMaximumChargeCurrent }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error ?? "Unable to update the user charge limit.");
+        status.textContent = `${result.status} Waiting for the EVSE state update…`;
+        status.className = "";
+        chargingControlsActive = false;
+        refreshPending = false;
+        loadEvses();
+    } catch (error) {
+        status.textContent = error.message;
+        status.className = "error";
+        control.disabled = false;
+        control.classList.remove("is-busy");
+    }
 }
 
 function currentInput(labelText, value, minimum) {

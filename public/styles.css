@@ -60,6 +60,11 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
 .charging-controls { align-items: end; grid-template-columns: repeat(2, minmax(0, 1fr)) auto; margin-top: 1.25rem; }
 .charging-controls label { display: grid; gap: .3rem; }
 .charging-controls button { height: fit-content; }
+.user-current-limit { margin-top: 1.25rem; }
+.user-current-limit-controls { align-items: center; grid-template-columns: minmax(7rem, auto) minmax(0, 1fr) minmax(4rem, auto) auto; }
+.user-current-limit-controls label { font-weight: 650; }
+.user-current-limit-controls input { padding: 0; width: 100%; }
+.user-current-limit-controls output { margin: 0; min-height: 0; }
 .node-selector { display: grid; gap: .5rem; }
 .preferences-selector { display: grid; gap: .5rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .preferences-selector label { font-weight: 650; }
@@ -93,5 +98,5 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
   nav { display: flex; }
   nav a { padding: .45rem .65rem; }
   main { margin: 0; padding: 2rem 1rem; }
-  .charging-controls { grid-template-columns: 1fr; }
+  .charging-controls, .user-current-limit-controls { grid-template-columns: 1fr; }
 }

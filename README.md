@@ -65,6 +65,10 @@ defaults the maximum to the reported circuit capacity, rather than the current
 maximum charge current, because a disabled EVSE reports the latter as zero.
 The demo validates a 6 A minimum and does not allow a requested maximum above
 the device's reported circuit capacity before sending the timed EVSE command.
+It also provides a **User charge limit** slider. The slider writes
+`UserMaximumChargeCurrent` in 1 A increments from 0 A to the device-reported
+`CircuitCapacity`; the effective charge limit remains subject to the EVSE's
+hardware, cable, circuit, and active command limits.
 
 ## Charging preferences
 

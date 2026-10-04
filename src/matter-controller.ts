@@ -27,6 +27,7 @@ export type EvseStatus = {
     circuitCapacity: number | null;
     minimumChargeCurrent: number | null;
     maximumChargeCurrent: number | null;
+    userMaximumChargeCurrent: number | null;
     sessionId: number | null;
     sessionDuration: number | null;
     sessionEnergyCharged: number | null;
@@ -162,6 +163,7 @@ export class MatterControllerService {
                     circuitCapacity: numberOrNull(state.circuitCapacity),
                     minimumChargeCurrent: numberOrNull(state.minimumChargeCurrent),
                     maximumChargeCurrent: numberOrNull(state.maximumChargeCurrent),
+                    userMaximumChargeCurrent: numberOrNull(state.userMaximumChargeCurrent),
                     sessionId: numberOrNull(state.sessionId),
                     sessionDuration: numberOrNull(state.sessionDuration),
                     sessionEnergyCharged: numberOrNull(state.sessionEnergyCharged),
@@ -236,6 +238,24 @@ export class MatterControllerService {
             }),
         );
         return `Charging enabled from ${minimumChargeCurrent / 1_000} A to ${maximumChargeCurrent / 1_000} A.`;
+    }
+
+    async setUserMaximumChargeCurrent(nodeId: string, endpointId: string, userMaximumChargeCurrent: number) {
+        if (!Number.isSafeInteger(userMaximumChargeCurrent) || userMaximumChargeCurrent < 0) {
+            throw new Error("User maximum charge current must be a non-negative whole number of milliamps.");
+        }
+
+        const { endpoint, state } = await this.getEvseEndpoint(nodeId, endpointId);
+        const circuitCapacity = numberOrNull(state.circuitCapacity);
+        if (circuitCapacity === null || circuitCapacity < 0) {
+            throw new Error("The EVSE has not reported a usable circuit capacity.");
+        }
+        if (userMaximumChargeCurrent > circuitCapacity) {
+            throw new Error(`User maximum charge current cannot exceed the circuit capacity of ${circuitCapacity / 1_000} A.`);
+        }
+
+        await endpoint.setStateOf(EnergyEvseClient, { userMaximumChargeCurrent });
+        return `User charge limit set to ${userMaximumChargeCurrent / 1_000} A.`;
     }
 
     async getChargingPreferences(nodeId: string, endpointId: string): Promise<ChargingPreferences> {

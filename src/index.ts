@@ -71,6 +71,20 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
         return;
     }
 
+    const userMaximumChargeCurrentAction = /^\/api\/evses\/(\d+)\/(\d+)\/user-maximum-charge-current$/.exec(url.pathname);
+    if (request.method === "POST" && userMaximumChargeCurrentAction !== null) {
+        const [, nodeId, endpointId] = userMaximumChargeCurrentAction;
+        const body = await readJson(request);
+        sendJson(response, 200, {
+            status: await controller.setUserMaximumChargeCurrent(
+                nodeId,
+                endpointId,
+                requiredNonNegativeChargeCurrent(body.userMaximumChargeCurrent, "userMaximumChargeCurrent"),
+            ),
+        });
+        return;
+    }
+
     const chargingTargets = /^\/api\/evses\/(\d+)\/(\d+)\/charging-targets$/.exec(url.pathname);
     if (chargingTargets !== null) {
         const [, nodeId, endpointId] = chargingTargets;
@@ -254,6 +268,14 @@ function requiredChargeCurrent(value: unknown, name: string) {
         throw new Error(`"${name}" must be a whole number of milliamps.`);
     }
     return value;
+}
+
+function requiredNonNegativeChargeCurrent(value: unknown, name: string) {
+    const current = requiredChargeCurrent(value, name);
+    if (current < 0) {
+        throw new Error(`"${name}" must not be negative.`);
+    }
+    return current;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
