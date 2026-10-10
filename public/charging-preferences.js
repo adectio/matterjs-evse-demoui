@@ -128,11 +128,6 @@ function updateTargetType(row) {
 function applyTargetCapabilities(row) {
     const type = row.querySelector(".target-type");
     const rangeOption = type.querySelector('option[value="range"]');
-    rangeOption.disabled = preferences?.supportsSoC === true;
-    if (preferences?.supportsSoC === true && type.value === "range") {
-        type.value = "soc";
-        updateTargetType(row);
-    }
 }
 
 function updateRangeSettingsVisibility() {
@@ -231,9 +226,7 @@ function renderPreferences() {
     }
     for (const row of targetList.children) applyTargetCapabilities(row);
     if (preferences.schedules.length === 0) {
-        result.textContent = preferences.supportsSoC
-            ? "No charging targets are stored on this EVSE. This SoC-reporting EVSE requires SoC targets."
-            : "No charging targets are stored on this EVSE.";
+        result.textContent = "No charging targets are stored on this EVSE.";
         return;
     }
     for (const schedule of preferences.schedules) {

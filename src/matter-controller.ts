@@ -291,12 +291,6 @@ export class MatterControllerService {
         }
         if (days.length === 0) throw new Error("Select at least one day.");
         if (targets.length === 0 || targets.length > 10) throw new Error("Add between one and ten charging targets.");
-        if (
-            endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true &&
-            targets.some(target => target.targetSoC === undefined)
-        ) {
-            throw new Error("This SoC-reporting EVSE requires a target SoC for every charging target.");
-        }
         if (approximateEvEfficiency !== undefined) {
             await endpoint.setStateOf(EnergyEvseClient, { approximateEvEfficiency });
         }
