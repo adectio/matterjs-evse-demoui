@@ -177,6 +177,38 @@ async function storeGridConditionsForecast(
   console.log(
     `Stored ${data.length} UK carbon intensity data points for ${postcode || 'national'}`
   );
+
+  // Update price server if available
+  try {
+    const priceServer = (globalThis as any).__priceServer;
+    if (priceServer) {
+      // Find current carbon intensity
+      const now = Math.floor(Date.now() / 1000);
+      const currentData = data.find(point => {
+        const start = Math.floor(new Date(point.from).getTime() / 1000);
+        const end = Math.floor(new Date(point.to).getTime() / 1000);
+        return start <= now && now < end;
+      });
+
+      if (currentData) {
+        const carbonIntensity = Math.round(currentData.intensity.forecast);
+        await priceServer.setGridConditions(carbonIntensity);
+      }
+
+      // Build forecast for next 24 hours
+      const forecast = data.map(point => ({
+        periodStart: Math.floor(new Date(point.from).getTime() / 1000),
+        periodEnd: Math.floor(new Date(point.to).getTime() / 1000),
+        carbonIntensity: Math.round(point.intensity.forecast),
+      }));
+
+      if (forecast.length > 0) {
+        await priceServer.setGridForecast(forecast);
+      }
+    }
+  } catch (e) {
+    console.warn('Error updating price server from carbon intensity data:', e);
+  }
 }
 
 // EU Carbon Data fetcher (placeholder for multiple regions)

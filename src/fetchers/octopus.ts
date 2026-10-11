@@ -112,7 +112,7 @@ async function storePriceForecast(
 
   // Octopus returns prices in pence per kWh
   const currency = 'GBP';
-  const decimals = 3; // pence = 0.001 GBP
+  const decimals = 2; // pence = 0.01 GBP (value_inc_vat * 100 gives pence units)
   const tariffUnit = 'kWh';
   const periodMinutes = 30;
 
@@ -176,6 +176,47 @@ async function storePriceForecast(
   console.log(
     `Stored ${halfHourlyRates.length} Octopus Agile rate points for region ${regionCode}`
   );
+
+  // Update price server if available
+  try {
+    const priceServer = (globalThis as any).__priceServer;
+    if (priceServer) {
+      // Find current and upcoming prices
+      const now = Math.floor(Date.now() / 1000);
+      const currentRate = halfHourlyRates.find(rate => {
+        const start = Math.floor(new Date(rate.valid_from).getTime() / 1000);
+        const end = Math.floor(new Date(rate.valid_to).getTime() / 1000);
+        return start <= now && now < end;
+      });
+
+      if (currentRate) {
+        const price = Math.round(currentRate.value_inc_vat * 100);
+        const priceLevel = await calculatePriceLevel(price, currency, decimals, tariffUnit);
+        // Get actual period times from Octopus API (convert to Unix timestamps)
+        const periodStart = Math.floor(new Date(currentRate.valid_from).getTime() / 1000);
+        const periodEnd = Math.floor(new Date(currentRate.valid_to).getTime() / 1000);
+        // GBP = 826 (ISO 4217), decimals=2 means 0.01 GBP units (pence)
+        await priceServer.setCurrentPrice(price, priceLevel, periodStart, periodEnd, 826, decimals);
+      }
+
+      // Build forecast from the current period onwards (Octopus returns newest first)
+      const forecast = halfHourlyRates
+        .map(rate => ({
+          periodStart: Math.floor(new Date(rate.valid_from).getTime() / 1000),
+          periodEnd: Math.floor(new Date(rate.valid_to).getTime() / 1000),
+          price: Math.round(rate.value_inc_vat * 100),
+          priceLevel: 0,
+        }))
+        .filter(entry => entry.periodEnd > now)
+        .sort((a, b) => a.periodStart - b.periodStart);
+
+      if (forecast.length > 0) {
+        await priceServer.setPriceForecast(forecast);
+      }
+    }
+  } catch (e) {
+    console.warn('Error updating price server from Octopus data:', e);
+  }
 }
 
 // Simple encryption placeholder - in production, use proper encryption

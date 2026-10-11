@@ -167,7 +167,7 @@ function renderPriceChart(forecast, metadata) {
   }
 
   const labels = forecast.map(p => formatTime(p.periodStart));
-  const decimals = metadata.decimals || 3;
+  const decimals = metadata.decimals || 2;
   const prices = forecast.map(p => p.price ? p.price / Math.pow(10, decimals) : 0);
   const colors = forecast.map(p => LEVEL_COLORS[p.priceLevel] || '#999');
 
@@ -204,8 +204,10 @@ function renderPriceChart(forecast, metadata) {
           callbacks: {
             label: function(context) {
               const value = context.parsed.y;
-              const price = value.toFixed(3);
-              return `${price} ${metadata.currency}/${metadata.tariff_unit}`;
+              const price = value.toFixed(2);
+              return metadata.currency === 'GBP'
+                ? `${price}p/${metadata.tariff_unit}`
+                : `${price} ${metadata.currency}/${metadata.tariff_unit}`;
             },
           },
         },
@@ -304,7 +306,11 @@ function renderGridChart(forecast, metadata) {
 function formatPrice(price, decimals, currency) {
   if (!price) return '—';
   const value = price / Math.pow(10, decimals);
-  return `${value.toFixed(decimals)} ${currency}`;
+  // Show pence for GBP (no pound sign since values are in pence)
+  const displayDecimals = 2;
+  return currency === 'GBP'
+    ? `${value.toFixed(displayDecimals)}p`
+    : `${value.toFixed(displayDecimals)} ${currency}`;
 }
 
 function formatTime(timestamp) {
