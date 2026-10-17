@@ -231,7 +231,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     if (request.method === "POST" && nodeAction !== null) {
         const [, nodeId, action] = nodeAction;
         if (action === "link-price-server") {
-            sendJson(response, 200, { status: await controller.linkEvseToPriceServer(nodeId) });
+            sendJson(response, 200, { status: await controller.linkPriceConsumer(nodeId) });
         } else if (action === "decommission") {
             await controller.decommission(nodeId);
             sendJson(response, 200, {

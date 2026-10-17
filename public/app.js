@@ -107,12 +107,12 @@ function renderNode(node) {
     details.textContent = [ROLE_LABELS[node.role], node.productName].filter(Boolean).join(" · ");
     item.append(id, details);
 
-    if (node.role === "evse") {
+    if (node.consumesPrices) {
         const link = document.createElement("button");
         link.className = "secondary";
         link.textContent = "Link to price server";
         link.addEventListener("click", async () => {
-            await runAction("Linking EVSE to price server…", `/api/nodes/${node.nodeId}/link-price-server`);
+            await runAction("Linking device to price server…", `/api/nodes/${node.nodeId}/link-price-server`);
         });
         item.append(link);
     }
