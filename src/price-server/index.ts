@@ -13,8 +13,10 @@ import { registerPriceServerAPI } from "./api.js";
 
 export { registerPriceServerAPI };
 export const PRICE_SERVER_NODE_ID = 0x2000;
-export const PRICE_SERVER_PASSCODE = 20202021;
-export const PRICE_SERVER_DISCRIMINATOR = 0xf00;
+// Deliberately distinct from the connectedhomeip example defaults (20202021 / 3840) used by the EVSE
+export const PRICE_SERVER_PASSCODE = 24681357;
+export const PRICE_SERVER_DISCRIMINATOR = 0xa00;
+export const PRICE_SERVER_PRODUCT_NAME = "Adectio Energy Tariff Server";
 
 
 /**
@@ -71,6 +73,14 @@ export class PriceServer {
         commissioning: {
           discriminator: PRICE_SERVER_DISCRIMINATOR,
           passcode: PRICE_SERVER_PASSCODE,
+        },
+        // Replaces the "Matter.js Test Product" defaults; also used as the DNS-SD DN advertisement
+        basicInformation: {
+          vendorName: "Adectio",
+          productName: PRICE_SERVER_PRODUCT_NAME,
+          productLabel: "Energy Tariff",
+          nodeLabel: PRICE_SERVER_PRODUCT_NAME,
+          productId: 0x8001,
         },
       });
 
@@ -157,6 +167,20 @@ export class PriceServer {
       },
       async () => ({ handled: false })
     );
+  }
+
+  /**
+   * Pairing details for the admin page
+   */
+  getPairingInfo() {
+    const commissioning = (this.serverNode?.state as any)?.commissioning;
+    return {
+      passcode: PRICE_SERVER_PASSCODE,
+      discriminator: PRICE_SERVER_DISCRIMINATOR,
+      manualPairingCode: commissioning?.pairingCodes?.manualPairingCode as string | undefined,
+      qrPairingCode: commissioning?.pairingCodes?.qrPairingCode as string | undefined,
+      commissioned: commissioning?.commissioned === true,
+    };
   }
 
   /**

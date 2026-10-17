@@ -1,16 +1,44 @@
 import { Environment, Seconds } from "@matter/main";
 import { BasicInformationClient } from "@matter/main/behaviors/basic-information";
 import { DescriptorClient } from "@matter/main/behaviors/descriptor";
+import { AccessControlClient } from "@matter/main/behaviors/access-control";
+import { BindingClient } from "@matter/main/behaviors/binding";
+import { CommodityPriceClient } from "@matter/main/behaviors/commodity-price";
+import { DescriptorClient } from "@matter/main/behaviors/descriptor";
+import { ElectricalGridConditionsClient } from "@matter/main/behaviors/electrical-grid-conditions";
 import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
-import { ElectricalPowerMeasurementCluster, EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
-import { isValidPasscode, ManualPairingCodeCodec, NodeId, QrPairingCodeCodec } from "@matter/main/types";
+import { OperationalCredentialsClient } from "@matter/main/behaviors/operational-credentials";
+import {
+    AccessControl,
+    CommodityPrice,
+    ElectricalGridConditions,
+    ElectricalPowerMeasurementCluster,
+    EnergyEvseCluster,
+    GeneralCommissioning,
+} from "@matter/main/clusters";
+import {
+    ClusterId,
+    EndpointNumber,
+    FabricIndex,
+    isValidPasscode,
+    ManualPairingCodeCodec,
+    NodeId,
+    QrPairingCodeCodec,
+} from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
+
+export type NodeRole = "evse" | "price-server" | "unknown";
 
 export type CommissionedNode = {
     nodeId: string;
     nodeName?: string;
+    role: NodeRole;
+    /** True when the node has CommodityPrice or ElectricalGridConditions client clusters (EVSE, appliance, ...) */
+    consumesPrices: boolean;
+    productName?: string;
     commissionedAt?: string;
+    linkStatus?: string;
 };
 
 export type CommissionableDevice = {
@@ -18,7 +46,15 @@ export type CommissionableDevice = {
     discriminator: number;
     deviceName?: string;
     deviceType?: number;
+    role: NodeRole;
 };
+
+/** Matter device type IDs used to label commissionable devices before commissioning */
+const EVSE_DEVICE_TYPE = 0x050c;
+const ELECTRICAL_ENERGY_TARIFF_DEVICE_TYPE = 0x0513;
+
+/** Clusters on the price server that price consumers are bound to and granted View access on */
+const PRICE_CLUSTER_IDS: ClusterId[] = [CommodityPrice.Cluster.id, ElectricalGridConditions.Cluster.id];
 
 export type EvseStatus = {
     nodeId: string;
@@ -106,9 +142,13 @@ export class MatterControllerService {
         const nodes: CommissionedNode[] = [];
         for (const nodeId of this.controller.getCommissionedNodes()) {
             const basicInformation = (await this.controller.getNode(nodeId)).basicInformation;
+            const node = await this.controller.getNode(nodeId);
             nodes.push({
                 nodeId: nodeId.toString(),
                 nodeName: basicInformation?.nodeLabel || basicInformation?.productName || undefined,
+                role: roleOf(node),
+                consumesPrices: priceClientEndpointsOf(node).length > 0,
+                productName: productNameOf(node),
             });
         }
         return nodes;
@@ -126,11 +166,125 @@ export class MatterControllerService {
             discriminator: device.D,
             deviceName: device.DN,
             deviceType: device.DT,
+            role: roleOfDeviceType(device.DT),
         }));
     }
 
-    async commission(pairingCode: string, discriminator?: string): Promise<CommissionedNode> {
-        const pairing = parsePairingCode(pairingCode, discriminator);
+    /**
+     * Commission a device and, depending on what it turns out to be, link it to the price server:
+     * a price consumer is bound to the price server; a price server gets every known price consumer bound to it.
+     */
+    async commission(
+        pairingCode: string,
+        discriminator?: string,
+        expectedRole?: NodeRole,
+    ): Promise<CommissionedNode> {
+        const nodeId = await this.commissionNode(parsePairingCode(pairingCode, discriminator));
+        const node = await this.controller.getNode(nodeId);
+        if (!(await ensureConnected(node))) {
+            return {
+                nodeId: nodeId.toString(),
+                role: "unknown",
+                consumesPrices: false,
+                linkStatus: "Commissioned, but could not connect to read its endpoints.",
+            };
+        }
+
+        const role = roleOf(node);
+        const consumesPrices = priceClientEndpointsOf(node).length > 0;
+        const result: CommissionedNode = {
+            nodeId: nodeId.toString(),
+            role,
+            consumesPrices,
+            productName: productNameOf(node),
+        };
+        if (expectedRole !== undefined && role !== expectedRole) {
+            result.linkStatus = `Commissioned, but this node is a ${role} device, not a ${expectedRole}.`;
+            return result;
+        }
+
+        if (role === "price-server") {
+            result.linkStatus = await this.linkAllPriceConsumers();
+        } else if (consumesPrices) {
+            result.linkStatus = await this.linkPriceConsumer(nodeId.toString());
+        }
+        return result;
+    }
+
+    /** Link every commissioned price consumer to the price server, e.g. after the price server is commissioned */
+    async linkAllPriceConsumers(): Promise<string> {
+        const consumerNodeIds = (await this.listNodes()).filter(n => n.consumesPrices).map(n => n.nodeId);
+        const statuses = [];
+        for (const consumerNodeId of consumerNodeIds) {
+            statuses.push(`${consumerNodeId}: ${await this.linkPriceConsumer(consumerNodeId).catch(errorMessage)}`);
+        }
+        return statuses.length ? statuses.join(" ") : "No price consumers commissioned yet to link.";
+    }
+
+    /**
+     * Point a price consumer's Binding cluster at the price server's CommodityPrice and ElectricalGridConditions
+     * clusters and grant the consumer View access to them on the price server.
+     */
+    async linkPriceConsumer(consumerNodeId: string): Promise<string> {
+        const priceServerNodeId = (await this.listNodes()).find(n => n.role === "price-server")?.nodeId;
+        if (priceServerNodeId === undefined) {
+            return "No price server commissioned yet; the device will be linked when one is.";
+        }
+
+        const consumerNode = await this.controller.getNode(parseNodeId(consumerNodeId));
+        if (!(await ensureConnected(consumerNode))) {
+            throw new Error("Could not connect to the device within 30 seconds; it was not linked to the price server.");
+        }
+        const priceClientEndpoints = priceClientEndpointsOf(consumerNode);
+        if (priceClientEndpoints.length === 0) {
+            return "The device has no CommodityPrice or ElectricalGridConditions client clusters; nothing to link.";
+        }
+        // The Binding cluster should live alongside the client clusters, but fall back to any endpoint with one
+        const bindingEndpoints = [...consumerNode.node.endpoints].filter(e => e.maybeStateOf(BindingClient) !== undefined);
+        const clientEndpoint = priceClientEndpoints.find(e => bindingEndpoints.includes(e.endpoint)) ?? priceClientEndpoints[0];
+        const bindingEndpoint = bindingEndpoints.includes(clientEndpoint.endpoint)
+            ? clientEndpoint.endpoint
+            : bindingEndpoints[0];
+        if (bindingEndpoint === undefined) {
+            return "The device has no Binding cluster, so it was not linked to the price server.";
+        }
+
+        const priceNode = await this.controller.getNode(parseNodeId(priceServerNodeId));
+        if (!(await ensureConnected(priceNode))) {
+            throw new Error("Could not connect to the price server within 30 seconds; the device was not linked.");
+        }
+        const tariffEndpoint = [...priceNode.node.endpoints].find(
+            e =>
+                e.maybeStateOf(CommodityPriceClient) !== undefined &&
+                e.maybeStateOf(ElectricalGridConditionsClient) !== undefined,
+        );
+        if (tariffEndpoint === undefined) {
+            throw new Error("The price server does not expose CommodityPrice and ElectricalGridConditions.");
+        }
+        const tariffEndpointNumber = EndpointNumber(tariffEndpoint.number);
+
+        // Grant access first so the consumer can subscribe as soon as it sees the binding
+        await grantPriceServerView(priceNode, BigInt(consumerNodeId), tariffEndpointNumber);
+
+        const fabricIndex = currentFabricIndexOf(consumerNode);
+        const existingBindings = bindingEndpoint.stateOf(BindingClient).binding;
+        const priceNodeId = NodeId(BigInt(priceServerNodeId));
+        const missingBindings = clientEndpoint.clusters
+            .filter(
+                cluster =>
+                    !existingBindings.some(
+                        b => b.node === priceNodeId && b.endpoint === tariffEndpointNumber && b.cluster === cluster,
+                    ),
+            )
+            .map(cluster => ({ node: priceNodeId, endpoint: tariffEndpointNumber, cluster, fabricIndex }));
+        if (missingBindings.length === 0) {
+            return `Already bound to price server ${priceServerNodeId}.`;
+        }
+        await bindingEndpoint.setStateOf(BindingClient, { binding: [...existingBindings, ...missingBindings] });
+        return `Bound endpoint ${bindingEndpoint.number} to price server ${priceServerNodeId} endpoint ${tariffEndpointNumber}.`;
+    }
+
+    private async commissionNode(pairing: PairingDetails) {
         const options: NodeCommissioningOptions = {
             commissioning: {
                 regulatoryLocation: GeneralCommissioning.RegulatoryLocationType.IndoorOutdoor,
@@ -144,8 +298,7 @@ export class MatterControllerService {
             passcode: pairing.passcode,
         };
 
-        const nodeId = await this.controller.commissionNode(options, { connectNodeAfterCommissioning: false });
-        return { nodeId: nodeId.toString() };
+        return this.controller.commissionNode(options, { connectNodeAfterCommissioning: false });
     }
 
     async getEvseStatuses(selectedNodeId?: string): Promise<EvseStatus[]> {
@@ -159,6 +312,7 @@ export class MatterControllerService {
         for (const nodeId of nodeIds) {
             if (selectedNode !== undefined && nodeId !== selectedNode) continue;
             const node = await this.controller.getNode(nodeId);
+            if (roleOf(node) === "price-server") continue;
             this.subscribeToEvseChanges(node, nodeId.toString());
             if (!(await ensureConnected(node))) continue;
 
@@ -441,6 +595,87 @@ export class MatterControllerService {
     }
 }
 
+function roleOf(node: PairedNode): NodeRole {
+    const endpoints = [...node.node.endpoints];
+    if (endpoints.some(e => e.maybeStateOf(CommodityPriceClient) !== undefined)) return "price-server";
+    if (endpoints.some(e => e.maybeStateOf(EnergyEvseClient) !== undefined)) return "evse";
+    return "unknown";
+}
+
+/** Endpoints declaring CommodityPrice and/or ElectricalGridConditions client clusters, with those clusters */
+function priceClientEndpointsOf(node: PairedNode) {
+    return [...node.node.endpoints]
+        .map(endpoint => ({
+            endpoint,
+            clusters: PRICE_CLUSTER_IDS.filter(cluster =>
+                endpoint.maybeStateOf(DescriptorClient)?.clientList.includes(cluster),
+            ),
+        }))
+        .filter(({ clusters }) => clusters.length > 0);
+}
+
+function roleOfDeviceType(deviceType: number | undefined): NodeRole {
+    if (deviceType === EVSE_DEVICE_TYPE) return "evse";
+    if (deviceType === ELECTRICAL_ENERGY_TARIFF_DEVICE_TYPE) return "price-server";
+    return "unknown";
+}
+
+function productNameOf(node: PairedNode) {
+    try {
+        return node.basicInformation?.productName;
+    } catch {
+        return undefined;
+    }
+}
+
+function currentFabricIndexOf(node: PairedNode) {
+    const fabricIndex = node.node.maybeStateOf(OperationalCredentialsClient)?.currentFabricIndex;
+    if (fabricIndex === undefined) {
+        throw new Error("Could not determine this controller's fabric index on the node.");
+    }
+    return FabricIndex(fabricIndex);
+}
+
+/**
+ * Add the consumer as a subject of a single shared View entry targeting the price clusters, keeping all other ACL
+ * entries (including our own Administer entry) untouched.
+ */
+async function grantPriceServerView(priceNode: PairedNode, consumerNodeId: bigint, endpoint: EndpointNumber) {
+    const fabricIndex = currentFabricIndexOf(priceNode);
+    const acl = priceNode.node.stateOf(AccessControlClient).acl.map(entry => ({
+        privilege: entry.privilege,
+        authMode: entry.authMode,
+        subjects: entry.subjects,
+        targets: entry.targets,
+        fabricIndex: entry.fabricIndex,
+    }));
+    const isPriceViewEntry = (entry: (typeof acl)[number]) =>
+        entry.privilege === AccessControl.AccessControlEntryPrivilege.View &&
+        entry.authMode === AccessControl.AccessControlEntryAuthMode.Case &&
+        entry.targets?.length === PRICE_CLUSTER_IDS.length &&
+        entry.targets.every(t => t.endpoint === endpoint && t.cluster !== null && PRICE_CLUSTER_IDS.includes(t.cluster));
+
+    const existing = acl.find(isPriceViewEntry);
+    if (existing?.subjects?.some(subject => BigInt(subject) === consumerNodeId)) return;
+
+    if (existing !== undefined) {
+        existing.subjects = [...(existing.subjects ?? []), NodeId(consumerNodeId)];
+    } else {
+        acl.push({
+            privilege: AccessControl.AccessControlEntryPrivilege.View,
+            authMode: AccessControl.AccessControlEntryAuthMode.Case,
+            subjects: [NodeId(consumerNodeId)],
+            targets: PRICE_CLUSTER_IDS.map(cluster => ({ cluster, endpoint, deviceType: null })),
+            fabricIndex,
+        });
+    }
+    await priceNode.node.setStateOf(AccessControlClient, { acl });
+}
+
+function errorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error);
+}
+
 function parsePairingCode(input: string, suppliedDiscriminator?: string): PairingDetails {
     const pairingCode = input.trim().replace(/\s/g, "");
     if (pairingCode.length === 0) {
@@ -527,7 +762,9 @@ function daysFromBitmap(bitmap: TargetDayBitmap) {
     return targetDays.filter(day => bitmap[day] === true);
 }
 
-async function ensureConnected(node: Awaited<ReturnType<CommissioningController["getNode"]>>) {
+type PairedNode = Awaited<ReturnType<CommissioningController["getNode"]>>;
+
+async function ensureConnected(node: PairedNode) {
     if (node.isConnected) return true;
 
     node.connect({ autoSubscribe: true });

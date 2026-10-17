@@ -9,7 +9,7 @@ import { handleApiRequest } from "./api/handler.js";
 import { initializeDatabase, closeDatabase } from "./database/schema.js";
 import { initializeRedis, closeRedis } from "./database/cache.js";
 import { initializeScheduler, stopScheduler } from "./fetchers/scheduler.js";
-import { initializePriceServer } from "./price-server/index.js";
+import { initializePriceServer, PRICE_SERVER_DISCRIMINATOR, PRICE_SERVER_PASSCODE } from "./price-server/index.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
@@ -38,7 +38,7 @@ try {
   priceServer = await initializePriceServer();
 
   // Register price server with fetchers for updates
-  if (globalThis.__priceServer === undefined) {
+  if ((globalThis as any).__priceServer === undefined) {
     (globalThis as any).__priceServer = priceServer;
   }
 } catch (error) {
@@ -191,7 +191,39 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
             requiredString(body.pairingCode, "pairingCode"),
             optionalString(body.discriminator),
         );
-        sendJson(response, 201, { node });
+        sendJson(response, 201, { node, status: commissionedStatus(node) });
+        return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/price-server-pairing") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        const pairing = priceServer.getPairingInfo();
+        sendJson(response, 200, {
+            pairing: {
+                ...pairing,
+                qrSvg: pairing.qrPairingCode
+                    ? await QRCode.toString(pairing.qrPairingCode, { errorCorrectionLevel: "M", margin: 1, type: "svg", width: 192 })
+                    : undefined,
+            },
+        });
+        return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/commission-price-server") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        // Use the price server's own (distinct) passcode and discriminator so an EVSE can never be picked up instead
+        const node = await controller.commission(
+            String(PRICE_SERVER_PASSCODE),
+            String(PRICE_SERVER_DISCRIMINATOR),
+            "price-server",
+        );
+        sendJson(response, 201, { node, status: commissionedStatus(node) });
         return;
     }
 
@@ -201,10 +233,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
         return;
     }
 
-    const nodeAction = /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window)$/.exec(url.pathname);
+    const nodeAction =
+        /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window|link-price-server)$/.exec(url.pathname);
     if (request.method === "POST" && nodeAction !== null) {
         const [, nodeId, action] = nodeAction;
-        if (action === "decommission") {
+        if (action === "link-price-server") {
+            sendJson(response, 200, { status: await controller.linkPriceConsumer(nodeId) });
+        } else if (action === "decommission") {
             await controller.decommission(nodeId);
             sendJson(response, 200, {
                 status: "Remote fabric removal completed. The device has been decommissioned.",
@@ -315,6 +350,12 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
     } catch {
         throw new Error("Request body must be valid JSON.");
     }
+}
+
+function commissionedStatus(node: { nodeId: string; role: string; productName?: string; linkStatus?: string }) {
+    const label = { evse: "EVSE", "price-server": "price server", unknown: "device" }[node.role] ?? "device";
+    const name = node.productName ? ` (${node.productName})` : "";
+    return [`Commissioned ${label} ${node.nodeId}${name}.`, node.linkStatus].filter(Boolean).join(" ");
 }
 
 function requiredString(value: unknown, name: string) {

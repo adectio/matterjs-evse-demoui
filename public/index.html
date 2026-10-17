@@ -33,6 +33,18 @@
 
       <section class="card">
         <div class="section-heading">
+          <h2>Local price server</h2>
+          <button id="commission-price-server">Commission price server</button>
+        </div>
+        <p class="muted">The built-in Electrical Energy Tariff device (CommodityPrice and ElectricalGridConditions). It uses its own pairing code, so it cannot be confused with an EVSE. Once commissioned, every device with CommodityPrice or ElectricalGridConditions client clusters and a Binding cluster (EVSEs, appliances, …) is bound to it.</p>
+        <div id="price-server-qr" class="qr-code" role="img" aria-label="Price server QR code"></div>
+        <label>Manual pairing code <code id="price-server-manual-code">—</code></label>
+        <label>Setup PIN / discriminator <code id="price-server-pin">—</code></label>
+        <output id="price-server-status" aria-live="polite"></output>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
           <h2>Commissionable devices</h2>
           <button id="discover" class="secondary">Find devices</button>
         </div>
