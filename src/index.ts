@@ -1,17 +1,49 @@
+import "dotenv/config";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { TimeoutError } from "@matter/main";
 import QRCode from "qrcode";
 import { MatterControllerService } from "./matter-controller.js";
+import { handleApiRequest } from "./api/handler.js";
+import { initializeDatabase, closeDatabase } from "./database/schema.js";
+import { initializeRedis, closeRedis } from "./database/cache.js";
+import { initializeScheduler, stopScheduler } from "./fetchers/scheduler.js";
+import { initializePriceServer } from "./price-server/index.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 const publicDirectory = join(process.cwd(), "public");
 const controller = new MatterControllerService();
+let priceServer: any = null;
 
 assertNodeVersion();
 await controller.start();
+
+// Initialize data fetching infrastructure first (so price server has data)
+try {
+  console.log("Initializing database...");
+  await initializeDatabase();
+  console.log("Initializing Redis...");
+  await initializeRedis();
+  console.log("Starting data fetcher scheduler...");
+  await initializeScheduler();
+} catch (error) {
+  console.warn("Failed to initialize data fetching:", error);
+}
+
+// Initialize price server after fetchers (so it has data available)
+try {
+  console.log("Initializing price server...");
+  priceServer = await initializePriceServer();
+
+  // Register price server with fetchers for updates
+  if (globalThis.__priceServer === undefined) {
+    (globalThis as any).__priceServer = priceServer;
+  }
+} catch (error) {
+  console.warn("Failed to initialize price server:", error);
+}
 
 const server = createServer(async (request, response) => {
     try {
@@ -28,15 +60,45 @@ server.listen(port, host, () => {
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-        server.close(() => {
-            controller.close().finally(() => process.exit(0));
+    process.on(signal, async () => {
+        server.close(async () => {
+            if (priceServer) await priceServer.stop();
+            await stopScheduler();
+            await closeRedis();
+            await closeDatabase();
+            await controller.close();
+            process.exit(0);
         });
     });
 }
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse) {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+
+    // Try price server API first
+    if (priceServer && url.pathname.startsWith("/api/price-server/")) {
+        try {
+            const body = request.method === "POST" ? await readJson(request) : undefined;
+            const handler = priceServer.getAPIHandler();
+            const result = await handler(url.pathname, request.method ?? "GET", body);
+            if (result.handled) {
+                return sendJson(response, result.statusCode || 200, result.response);
+            }
+        } catch (error) {
+            console.error("Price server API error:", error);
+            return sendJson(response, 500, { error: (error as Error).message });
+        }
+    }
+
+    // Try existing API handler
+    try {
+        const handled = await handleApiRequest(url.pathname, request.method ?? "GET", url, response);
+        if (handled) return;
+    } catch (error) {
+        console.error("API handler error:", error);
+        sendJson(response, 500, { error: (error as Error).message });
+        return;
+    }
 
     if (request.method === "GET" && url.pathname === "/api/health") {
         sendJson(response, 200, { status: "ready" });
