@@ -44,7 +44,7 @@ async function loadNodes() {
         const response = await fetch("/api/nodes");
         const { nodes, error } = await response.json();
         if (!response.ok) throw new Error(error ?? "Unable to list commissioned nodes.");
-        nodeSelect.replaceChildren(...nodes.map(node => new Option(`Node ${node.nodeId}`, node.nodeId)));
+        nodeSelect.replaceChildren(...nodes.map(node => new Option(node.nodeName ? `${node.nodeName} (Node ${node.nodeId})` : `Node ${node.nodeId}`, node.nodeId)));
         nodeSelect.disabled = nodes.length === 0;
         const selected = localStorage.getItem("selectedMatterNodeId");
         if (nodes.some(node => node.nodeId === selected)) nodeSelect.value = selected;

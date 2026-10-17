@@ -79,12 +79,22 @@ function renderDiscoveredDevice(device) {
 
 function renderNode(node) {
     const item = document.createElement("li");
-    item.innerHTML = `<code>${node.nodeId}</code>`;
+    const label = document.createElement("div");
+    label.className = "node-label";
+    if (node.nodeName) {
+        const name = document.createElement("span");
+        name.textContent = node.nodeName;
+        label.append(name);
+    }
+    const id = document.createElement("code");
+    id.textContent = node.nodeId;
+    label.append(id);
+    item.append(label);
 
     const decommission = document.createElement("button");
     decommission.textContent = "Decommission";
     decommission.addEventListener("click", async () => {
-        if (!confirm(`Decommission ${node.nodeId} from this Matter fabric?`)) return;
+        if (!confirm(`Decommission ${nodeDisplayName(node)} from this Matter fabric?`)) return;
         await runAction("Decommissioning device…", `/api/nodes/${node.nodeId}/decommission`);
     });
 
@@ -99,12 +109,16 @@ function renderNode(node) {
     forget.className = "secondary";
     forget.textContent = "Force forget";
     forget.addEventListener("click", async () => {
-        if (!confirm(`Forget ${node.nodeId} locally? The device will retain this Matter fabric.`)) return;
+        if (!confirm(`Forget ${nodeDisplayName(node)} locally? The device will retain this Matter fabric.`)) return;
         await runAction("Forgetting device locally…", `/api/nodes/${node.nodeId}/force-forget`);
     });
 
     item.append(openWindow, decommission, forget);
     return item;
+}
+
+function nodeDisplayName(node) {
+    return node.nodeName ? `${node.nodeName} (node ${node.nodeId})` : `node ${node.nodeId}`;
 }
 
 async function openCommissioningWindow(nodeId) {

@@ -1,4 +1,6 @@
 import { Environment, Seconds } from "@matter/main";
+import { BasicInformationClient } from "@matter/main/behaviors/basic-information";
+import { DescriptorClient } from "@matter/main/behaviors/descriptor";
 import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
 import { ElectricalPowerMeasurementCluster, EnergyEvseCluster, GeneralCommissioning } from "@matter/main/clusters";
@@ -7,6 +9,7 @@ import { CommissioningController, NodeCommissioningOptions } from "@project-chip
 
 export type CommissionedNode = {
     nodeId: string;
+    nodeName?: string;
     commissionedAt?: string;
 };
 
@@ -39,6 +42,15 @@ export type EvseStatus = {
     activePower: number | null;
     voltage: number | null;
     activeCurrent: number | null;
+};
+
+export type CompanionNode = {
+    nodeId: string;
+    vendorName?: string;
+    productName?: string;
+    nodeName?: string;
+    hasSubscription: boolean;
+    endpoints: { endpointId: number; deviceTypes: number[] }[];
 };
 
 export type ChargingTargetView = {
@@ -90,8 +102,16 @@ export class MatterControllerService {
         this.#controller = controller;
     }
 
-    listNodes(): CommissionedNode[] {
-        return this.controller.getCommissionedNodes().map(nodeId => ({ nodeId: nodeId.toString() }));
+    async listNodes(): Promise<CommissionedNode[]> {
+        const nodes: CommissionedNode[] = [];
+        for (const nodeId of this.controller.getCommissionedNodes()) {
+            const basicInformation = (await this.controller.getNode(nodeId)).basicInformation;
+            nodes.push({
+                nodeId: nodeId.toString(),
+                nodeName: basicInformation?.nodeLabel || basicInformation?.productName || undefined,
+            });
+        }
+        return nodes;
     }
 
     async discoverCommissionableDevices(): Promise<CommissionableDevice[]> {
@@ -179,6 +199,44 @@ export class MatterControllerService {
             }
         }
         return statuses;
+    }
+
+    async listCompanionNodes(): Promise<CompanionNode[]> {
+        const nodes: CompanionNode[] = [];
+        for (const nodeId of this.controller.getCommissionedNodes()) {
+            const node = await this.controller.getNode(nodeId);
+            const basicInformation = node.basicInformation;
+            nodes.push({
+                nodeId: nodeId.toString(),
+                vendorName: basicInformation?.vendorName,
+                productName: basicInformation?.productName,
+                nodeName: basicInformation?.nodeLabel || undefined,
+                hasSubscription: node.isConnected,
+                endpoints: [...node.node.endpoints].flatMap(endpoint => {
+                    const descriptor = endpoint.maybeStateOf(DescriptorClient);
+                    if (descriptor === undefined) return [];
+                    return [
+                        {
+                            endpointId: Number(endpoint.number),
+                            deviceTypes: descriptor.deviceTypeList.map(entry => Number(entry.deviceType)),
+                        },
+                    ];
+                }),
+            });
+        }
+        return nodes;
+    }
+
+    async renameNode(nodeId: string, name: string) {
+        if (name.length > 32) {
+            throw new Error("The node name must be 32 characters or fewer.");
+        }
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the device within 30 seconds. The node was not renamed.");
+        }
+        await node.node.setStateOf(BasicInformationClient, { nodeLabel: name });
+        return `Node renamed to "${name}".`;
     }
 
     onEvseChanged(listener: () => void) {

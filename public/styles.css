@@ -39,6 +39,8 @@ ul { display: grid; gap: .75rem; list-style: none; margin: 0; padding: 0; }
 li { background: #f8fbff; border: 1px solid #e4ebf5; border-radius: 8px; padding: .75rem; }
 li code { margin-right: auto; overflow-wrap: anywhere; }
 li small { color: #64748b; margin-right: auto; }
+.node-label { display: grid; gap: .2rem; margin-right: auto; min-width: 8rem; }
+.node-label code { margin-right: 0; }
 .danger { border-color: #f0bac1; }
 .danger-button { background: #c83f54; color: #fff; }
 output { display: block; margin-top: 1rem; min-height: 1.5rem; }

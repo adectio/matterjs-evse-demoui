@@ -57,7 +57,7 @@ async function loadNodes() {
         if (!response.ok) throw new Error(error ?? "Unable to list commissioned nodes.");
 
         const previouslySelected = localStorage.getItem("selectedMatterNodeId");
-        nodeSelect.replaceChildren(...nodes.map(node => new Option(`Node ${node.nodeId}`, node.nodeId)));
+        nodeSelect.replaceChildren(...nodes.map(node => new Option(node.nodeName ? `${node.nodeName} (Node ${node.nodeId})` : `Node ${node.nodeId}`, node.nodeId)));
         nodeSelect.disabled = nodes.length === 0;
 
         if (nodes.some(node => node.nodeId === previouslySelected)) {

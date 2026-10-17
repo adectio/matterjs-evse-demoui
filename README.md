@@ -36,7 +36,10 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:3000>. Select **Find devices** to scan the local
+Open <http://127.0.0.1:3000>, or `http://<this-machine's-ip>:3000` from
+another device on the network. The server listens on all interfaces by
+default; set `HOST=127.0.0.1` to restrict it to local access, or `PORT` to
+change the port. Select **Find devices** to scan the local
 network for commissionable Matter devices (10 seconds). Then paste the Matter
 QR payload or manual pairing code and select **Commission device**.
 Commissioning searches the local network for up to 30 seconds.
@@ -109,6 +112,24 @@ only when you intentionally need to remove this application's local history.
   plus one-time plain-text QR/manual pairing codes for adding another Matter
   commissioner. Device support or
   authorization restrictions can cause this operation to fail.
+
+## iOS companion app
+
+The server implements the REST API used by the
+[Matter Controller Companion (MCC)](https://github.com/tomasmcguinness/matter-controller-companion-app)
+iOS app, so you can commission devices into this controller from an iPhone.
+In the app, add a controller with the address `http://<this-machine's-ip>:3000`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/companion/info` | Reachability check |
+| GET | `/api/companion/nodes` | List commissioned nodes with vendor/product name, node label and endpoint device types |
+| POST | `/api/companion/nodes` | Commission with `{ "setupCode": "MT:..." }`; returns `{ "nodeId": n }` once done, or `504` on timeout |
+| PUT | `/api/companion/nodes/{nodeId}/update` | Rename with `{ "name": "..." }` (writes the device's Basic Information `NodeLabel`) |
+| DELETE | `/api/companion/nodes/{nodeId}` | Decommission (same behaviour as **Decommission** above) |
+
+The companion API has **no authentication**. Only expose the server on a
+network you trust.
 
 ## Validation
 

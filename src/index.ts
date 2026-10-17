@@ -1,10 +1,12 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
+import { TimeoutError } from "@matter/main";
 import QRCode from "qrcode";
 import { MatterControllerService } from "./matter-controller.js";
 
 const port = Number(process.env.PORT ?? 3000);
+const host = process.env.HOST ?? "0.0.0.0";
 const publicDirectory = join(process.cwd(), "public");
 const controller = new MatterControllerService();
 
@@ -21,8 +23,8 @@ const server = createServer(async (request, response) => {
     }
 });
 
-server.listen(port, "127.0.0.1", () => {
-    console.log(`Matter EVSE demo is available at http://127.0.0.1:${port}`);
+server.listen(port, host, () => {
+    console.log(`Matter EVSE demo is listening on http://${host}:${port}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -41,8 +43,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
         return;
     }
 
+    if (url.pathname.startsWith("/api/companion/")) {
+        await handleCompanionRequest(request, response, url);
+        return;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/nodes") {
-        sendJson(response, 200, { nodes: controller.listNodes() });
+        sendJson(response, 200, { nodes: await controller.listNodes() });
         return;
     }
 
@@ -163,6 +170,48 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
     if (request.method === "GET") {
         await serveStaticFile(url.pathname, response);
+        return;
+    }
+
+    sendJson(response, 404, { error: "Not found" });
+}
+
+/** REST API used by the MCC iOS companion app (github.com/tomasmcguinness/matter-controller-companion-app). */
+async function handleCompanionRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
+    if (request.method === "GET" && url.pathname === "/api/companion/info") {
+        sendJson(response, 200, { name: "Matter EVSE Demo" });
+        return;
+    }
+
+    if (url.pathname === "/api/companion/nodes") {
+        if (request.method === "GET") {
+            sendJson(response, 200, await controller.listCompanionNodes());
+            return;
+        }
+        if (request.method === "POST") {
+            const body = await readJson(request);
+            try {
+                const node = await controller.commission(requiredString(body.setupCode, "setupCode"));
+                sendJson(response, 201, { nodeId: Number(node.nodeId) });
+            } catch (error) {
+                if (!(error instanceof TimeoutError)) throw error;
+                sendJson(response, 504, { error: error.message });
+            }
+            return;
+        }
+    }
+
+    const renameAction = /^\/api\/companion\/nodes\/(\d+)\/update$/.exec(url.pathname);
+    if (request.method === "PUT" && renameAction !== null) {
+        const body = await readJson(request);
+        sendJson(response, 200, { status: await controller.renameNode(renameAction[1], requiredString(body.name, "name")) });
+        return;
+    }
+
+    const nodeAction = /^\/api\/companion\/nodes\/(\d+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && nodeAction !== null) {
+        await controller.decommission(nodeAction[1]);
+        sendJson(response, 200, { status: "Remote fabric removal completed. The device has been decommissioned." });
         return;
     }
 
