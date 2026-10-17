@@ -9,6 +9,10 @@ const commissioningWindow = document.querySelector("#commissioning-window");
 const windowQrCode = document.querySelector("#window-qr-code");
 const windowManualCode = document.querySelector("#window-manual-code");
 const windowQrImage = document.querySelector("#window-qr-image");
+const commissionPriceServerButton = document.querySelector("#commission-price-server");
+const priceServerStatus = document.querySelector("#price-server-status");
+
+const ROLE_LABELS = { evse: "EVSE", "price-server": "Price server", unknown: "Other device" };
 
 document.querySelector("#commission-form").addEventListener("submit", async event => {
     event.preventDefault();
@@ -16,6 +20,24 @@ document.querySelector("#commission-form").addEventListener("submit", async even
     const discriminator = document.querySelector("#discriminator").value;
     await runAction("Commissioning device…", "/api/commission", { pairingCode, discriminator }, 201);
     event.target.reset();
+});
+
+commissionPriceServerButton.addEventListener("click", async () => {
+    commissionPriceServerButton.disabled = true;
+    priceServerStatus.textContent = "Commissioning price server…";
+    priceServerStatus.className = "";
+    try {
+        const response = await fetch("/api/commission-price-server", { method: "POST" });
+        const result = await response.json();
+        if (response.status !== 201) throw new Error(result.error ?? "Commissioning failed.");
+        priceServerStatus.textContent = result.status;
+        await Promise.all([loadNodes(), loadPriceServerPairing()]);
+    } catch (error) {
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    } finally {
+        commissionPriceServerButton.disabled = false;
+    }
 });
 
 document.querySelector("#refresh").addEventListener("click", loadNodes);
@@ -65,7 +87,7 @@ function renderDiscoveredDevice(device) {
     const name = document.createElement("span");
     name.textContent = device.deviceName ?? device.id;
     const details = document.createElement("small");
-    details.textContent = `Long discriminator: ${device.discriminator}`;
+    details.textContent = `${ROLE_LABELS[device.role]} · Long discriminator: ${device.discriminator}`;
     const select = document.createElement("button");
     select.className = "secondary";
     select.textContent = "Use discriminator";
@@ -79,7 +101,21 @@ function renderDiscoveredDevice(device) {
 
 function renderNode(node) {
     const item = document.createElement("li");
-    item.innerHTML = `<code>${node.nodeId}</code>`;
+    const id = document.createElement("code");
+    id.textContent = node.nodeId;
+    const details = document.createElement("small");
+    details.textContent = [ROLE_LABELS[node.role], node.productName].filter(Boolean).join(" · ");
+    item.append(id, details);
+
+    if (node.role === "evse") {
+        const link = document.createElement("button");
+        link.className = "secondary";
+        link.textContent = "Link to price server";
+        link.addEventListener("click", async () => {
+            await runAction("Linking EVSE to price server…", `/api/nodes/${node.nodeId}/link-price-server`);
+        });
+        item.append(link);
+    }
 
     const decommission = document.createElement("button");
     decommission.textContent = "Decommission";
@@ -137,7 +173,26 @@ async function runAction(pendingMessage, url, body, expectedStatus = 200) {
         const result = await response.json();
         if (response.status !== expectedStatus) throw new Error(result.error ?? "Request failed.");
         showStatus(result.status ?? "Done.");
-        await loadNodes();
+        await async function loadPriceServerPairing() {
+    try {
+        const response = await fetch("/api/price-server-pairing");
+        const { pairing, error } = await response.json();
+        if (!response.ok) throw new Error(error ?? "Price server unavailable.");
+        document.querySelector("#price-server-qr").innerHTML = pairing.qrSvg ?? "";
+        document.querySelector("#price-server-manual-code").textContent = pairing.manualPairingCode ?? "—";
+        document.querySelector("#price-server-pin").textContent = `${pairing.passcode} / ${pairing.discriminator}`;
+        if (pairing.commissioned) {
+            priceServerStatus.textContent = "The price server has been commissioned onto at least one fabric.";
+        }
+    } catch (error) {
+        commissionPriceServerButton.disabled = true;
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    }
+}
+
+loadNodes();
+loadPriceServerPairing();
     } catch (error) {
         showStatus(error.message, true);
     }
@@ -153,4 +208,23 @@ function showDiscoveryStatus(message, isError = false) {
     discoveryStatus.className = isError ? "error" : "";
 }
 
+async function loadPriceServerPairing() {
+    try {
+        const response = await fetch("/api/price-server-pairing");
+        const { pairing, error } = await response.json();
+        if (!response.ok) throw new Error(error ?? "Price server unavailable.");
+        document.querySelector("#price-server-qr").innerHTML = pairing.qrSvg ?? "";
+        document.querySelector("#price-server-manual-code").textContent = pairing.manualPairingCode ?? "—";
+        document.querySelector("#price-server-pin").textContent = `${pairing.passcode} / ${pairing.discriminator}`;
+        if (pairing.commissioned) {
+            priceServerStatus.textContent = "The price server has been commissioned onto at least one fabric.";
+        }
+    } catch (error) {
+        commissionPriceServerButton.disabled = true;
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    }
+}
+
 loadNodes();
+loadPriceServerPairing();
