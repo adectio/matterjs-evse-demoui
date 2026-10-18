@@ -114,7 +114,14 @@ export type ForecastSlotView = {
     maxPower: number | null;
     nominalEnergy: number | null;
     isPausable: boolean | null;
+    /** From the slot's DEM Costs, when the EVSE reports them */
+    financialCost: { value: number; currency: number | null } | null;
+    ghgEmissionsGrams: number | null;
 };
+
+/** DEM CostTypeEnum values */
+const COST_TYPE_FINANCIAL = 0;
+const COST_TYPE_GHG_EMISSIONS = 1;
 
 export type CompanionNode = {
     nodeId: string;
@@ -924,6 +931,12 @@ type DemForecast = {
         readonly maxPower?: number | bigint;
         readonly nominalEnergy?: number | bigint;
         readonly slotIsPausable?: boolean;
+        readonly costs?: readonly {
+            readonly costType: number;
+            readonly value: number;
+            readonly decimalPoints: number;
+            readonly currency?: number;
+        }[];
     }[];
 };
 
@@ -950,8 +963,21 @@ function forecastView(forecast: DemForecast | null | undefined): ForecastView | 
                 maxPower: numberOrNull(slot.maxPower),
                 nominalEnergy: numberOrNull(slot.nominalEnergy),
                 isPausable: slot.slotIsPausable ?? null,
+                ...slotCosts(slot.costs),
             };
         }),
+    };
+}
+
+/** Cost values with their decimal points applied (e.g. 18400 with 4 decimal points is 1.84) */
+function slotCosts(costs: DemForecast["slots"][number]["costs"]) {
+    const financial = costs?.find(cost => cost.costType === COST_TYPE_FINANCIAL);
+    const emissions = costs?.find(cost => cost.costType === COST_TYPE_GHG_EMISSIONS);
+    return {
+        financialCost: financial
+            ? { value: financial.value / 10 ** financial.decimalPoints, currency: financial.currency ?? null }
+            : null,
+        ghgEmissionsGrams: emissions ? emissions.value / 10 ** emissions.decimalPoints : null,
     };
 }
 

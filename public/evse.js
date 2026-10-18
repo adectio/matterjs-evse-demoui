@@ -9,6 +9,9 @@ let refreshPending = false;
 const forecastCharts = new Map();
 let priceForecastCache = { fetchedAt: 0, data: null };
 let carbonForecastCache = { fetchedAt: 0, data: null };
+// Tariff and carbon data behind the cards being rendered (for slot costs the EVSE doesn't report)
+let renderPrices = null;
+let renderCarbon = null;
 const PRICE_FORECAST_MAX_AGE_MS = 5 * 60 * 1000;
 
 const ForecastUpdateReason = Object.freeze({
@@ -101,6 +104,8 @@ async function loadEvses() {
         if (!response.ok) throw new Error(error ?? "Unable to retrieve EVSE state.");
         const hasForecast = evses.some(evse => evse.forecast !== null);
         const [prices, carbon] = hasForecast ? await Promise.all([loadPriceForecast(), loadCarbonForecast()]) : [null, null];
+        renderPrices = prices;
+        renderCarbon = carbon;
         evseList.replaceChildren(...evses.map(renderEvse));
         placeForecastCharts(evses, prices, carbon);
         emptyState.hidden = evses.length > 0;
@@ -371,6 +376,8 @@ function renderForecast(evse) {
     }
 
     const plannedEnergy = forecast.slots.reduce((total, slot) => total + (slot.nominalEnergy ?? 0), 0);
+    const costs = forecast.slots.map(slotCost);
+    const totals = totalCosts(forecast.slots, costs);
     const rows = forecast.slots
         .map((slot, index) => {
             const charging = (slot.nominalPower ?? 0) > 0;
@@ -381,6 +388,8 @@ function renderForecast(evse) {
               <td>${shortDuration(slot.duration)}</td>
               <td>${charging ? power(slot.nominalPower) : "Off"}</td>
               <td>${charging ? energy(slot.nominalEnergy) : "—"}</td>
+              <td>${charging ? money(costs[index].cost, costs[index].estimated) : "—"}</td>
+              <td>${charging ? emissions(costs[index].ghgGrams, costs[index].estimated) : "—"}</td>
             </tr>`;
         })
         .join("");
@@ -393,13 +402,89 @@ function renderForecast(evse) {
         ${metric("Ends", time(forecast.endTime))}
         ${metric("Must finish by", forecast.latestEndTime === null ? "Not set" : time(forecast.latestEndTime))}
         ${metric("Planned energy", energy(plannedEnergy))}
+        ${metric("Planned cost", money(totals.cost, totals.estimated) + (totals.usesEstimatedPrices ? " <small>(includes estimated prices)</small>" : ""))}
+        ${metric("Planned CO₂", emissions(totals.ghgGrams, totals.estimated))}
         ${metric("Planned by", forecastReasonLabel(forecast.forecastUpdateReason))}
       </dl>
       <div class="forecast-chart" data-chart-id="${forecastChartId(evse)}"></div>
       <table class="forecast-slots">
-        <thead><tr><th>Slot</th><th>Start</th><th>Duration</th><th>Power</th><th>Energy</th></tr></thead>
+        <thead><tr><th>Slot</th><th>Start</th><th>Duration</th><th>Power</th><th>Energy</th><th>Cost</th><th>CO₂</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
+}
+
+const CURRENCY_SYMBOLS = { 826: "£", GBP: "£", 978: "€", EUR: "€" };
+
+/**
+ * A slot's cost and CO2, as reported by the EVSE (DEM slot Costs) or, if it doesn't report them (e.g. the flat
+ * tariff build), estimated here from the tariff and carbon data shown on the chart.
+ */
+function slotCost(slot) {
+    if ((slot.nominalPower ?? 0) <= 0) return { cost: null, ghgGrams: null, estimated: false };
+    const reported = slot.financialCost !== null || slot.ghgEmissionsGrams !== null;
+    if (reported) {
+        return {
+            cost: slot.financialCost && { value: slot.financialCost.value, currency: slot.financialCost.currency },
+            ghgGrams: slot.ghgEmissionsGrams,
+            estimated: false,
+        };
+    }
+    // Prices are in pence (after the metadata decimal points), so the cost in pounds is a hundredth of the sum
+    const decimals = renderPrices?.metadata?.decimals ?? 2;
+    const pricePeriods = [...(renderPrices?.forecast ?? []), ...(renderPrices?.estimated ?? [])];
+    const pence = integrateOverPeriods(slot, pricePeriods, period => (period.price ?? NaN) / 10 ** decimals);
+    const grams = integrateOverPeriods(slot, renderCarbon?.forecast ?? [], period => period.gridCarbonIntensity ?? NaN);
+    return {
+        cost: pence === null ? null : { value: pence / 100, currency: renderPrices?.metadata?.currency ?? "GBP" },
+        ghgGrams: grams,
+        estimated: true,
+    };
+}
+
+/** Energy (kWh) x value per kWh across the periods a slot spans; null if any part isn't covered */
+function integrateOverPeriods(slot, periods, valuePerKwh) {
+    const end = slot.startTime + slot.duration;
+    const powerKw = (slot.nominalPower ?? 0) / 1_000_000;
+    let total = 0;
+    for (let time = slot.startTime; time < end; ) {
+        const period = periods.find(p => p.periodStart <= time && time < (p.periodEnd ?? p.periodStart + 1800));
+        if (!period) return null;
+        const value = valuePerKwh(period);
+        if (!Number.isFinite(value)) return null;
+        const until = Math.min(end, period.periodEnd ?? period.periodStart + 1800);
+        total += powerKw * ((until - time) / 3600) * value;
+        time = until;
+    }
+    return total;
+}
+
+function totalCosts(slots, costs) {
+    const charging = costs.filter((_, index) => (slots[index].nominalPower ?? 0) > 0);
+    const known = values => (values.every(value => value !== null) ? values : null);
+    const costValues = known(charging.map(cost => cost.cost));
+    const ghgValues = known(charging.map(cost => cost.ghgGrams));
+    // Slots in the period after the published tariff use estimated prices
+    const estimatedFrom = Math.min(...(renderPrices?.estimated ?? []).map(period => period.periodStart));
+    return {
+        cost: costValues && charging.length
+            ? { value: costValues.reduce((sum, cost) => sum + cost.value, 0), currency: costValues[0].currency }
+            : null,
+        ghgGrams: ghgValues && charging.length ? ghgValues.reduce((sum, grams) => sum + grams, 0) : null,
+        estimated: charging.some(cost => cost.estimated),
+        usesEstimatedPrices: slots.some(slot => (slot.nominalPower ?? 0) > 0 && slot.startTime + slot.duration > estimatedFrom),
+    };
+}
+
+function money(cost, estimated) {
+    if (!cost) return "Unavailable";
+    const symbol = CURRENCY_SYMBOLS[cost.currency] ?? "";
+    return `${symbol}${cost.value.toFixed(2)}${symbol ? "" : ` ${cost.currency ?? ""}`}${estimated ? " (est.)" : ""}`;
+}
+
+function emissions(grams, estimated) {
+    if (grams === null || grams === undefined) return "Unavailable";
+    const text = grams >= 1000 ? `${(grams / 1000).toFixed(2)} kg` : `${Math.round(grams)} g`;
+    return `${text}${estimated ? " (est.)" : ""}`;
 }
 
 function forecastReasonLabel(value) {
