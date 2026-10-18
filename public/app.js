@@ -125,6 +125,16 @@ function renderNode(node) {
         item.append(link);
     }
 
+    if (node.supportsTrustedTimeSource) {
+        const timeSource = document.createElement("button");
+        timeSource.className = "secondary";
+        timeSource.textContent = "Set trusted time source";
+        timeSource.addEventListener("click", async () => {
+            await runAction("Setting trusted time source…", `/api/nodes/${node.nodeId}/set-time-source`);
+        });
+        item.append(timeSource);
+    }
+
     const decommission = document.createElement("button");
     decommission.textContent = "Decommission";
     decommission.addEventListener("click", async () => {

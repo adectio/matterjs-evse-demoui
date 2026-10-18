@@ -234,11 +234,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     }
 
     const nodeAction =
-        /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window|link-price-server)$/.exec(url.pathname);
+        /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window|link-price-server|set-time-source)$/.exec(url.pathname);
     if (request.method === "POST" && nodeAction !== null) {
         const [, nodeId, action] = nodeAction;
         if (action === "link-price-server") {
             sendJson(response, 200, { status: await controller.linkPriceConsumer(nodeId) });
+        } else if (action === "set-time-source") {
+            sendJson(response, 200, { status: await controller.setTrustedTimeSource(nodeId) });
         } else if (action === "decommission") {
             await controller.decommission(nodeId);
             sendJson(response, 200, {

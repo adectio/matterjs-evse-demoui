@@ -4,12 +4,14 @@
  * Commissionable Matter device hosting:
  * - CommodityPrice cluster (0x0091)
  * - ElectricalGridConditions cluster (0x00A0)
+ * - TimeSynchronization cluster (0x0038) on the root endpoint, as a trusted time source
  */
 
 import { ServerNode } from "@matter/node";
 import { ElectricalEnergyTariffDevice } from "@matter/node/devices";
 import { CommodityPriceServer, ElectricalGridConditionsServer } from "@matter/node/behaviors";
 import { registerPriceServerAPI } from "./api.js";
+import { TimeSourceServer } from "./behaviors/time-source.js";
 
 export { registerPriceServerAPI };
 export const PRICE_SERVER_NODE_ID = 0x2000;
@@ -65,7 +67,7 @@ export class PriceServer {
 
     try {
       console.log("[PriceServer] Creating ServerNode...");
-      this.serverNode = await ServerNode.create({
+      this.serverNode = await ServerNode.create(ServerNode.RootEndpoint.with(TimeSourceServer), {
         id: "energy-tariff-server",
         network: {
           port: 5541, // Use different port from controller (5540)
@@ -138,6 +140,7 @@ export class PriceServer {
       console.log("[PriceServer] Clusters available:");
       console.log("[PriceServer]   - CommodityPrice (0x0091) ✓");
       console.log("[PriceServer]   - ElectricalGridConditions (0x00A0) ✓");
+      console.log("[PriceServer]   - TimeSynchronization (0x0038) on endpoint 0 ✓");
       console.log("[PriceServer] Update prices via: POST /api/price-server/set-price");
     } catch (error) {
       console.error("[PriceServer] Failed to start:", error);
