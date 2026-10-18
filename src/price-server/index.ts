@@ -2,7 +2,7 @@
  * Price Server - Matter ElectricalEnergyTariff Device
  *
  * Commissionable Matter device hosting:
- * - CommodityPrice cluster (0x0091)
+ * - CommodityPrice cluster (0x0095)
  * - ElectricalGridConditions cluster (0x00A0)
  */
 
@@ -10,6 +10,7 @@ import { ServerNode } from "@matter/node";
 import { ElectricalEnergyTariffDevice } from "@matter/node/devices";
 import { CommodityPriceServer, ElectricalGridConditionsServer } from "@matter/node/behaviors";
 import { registerPriceServerAPI } from "./api.js";
+import { getEstimatedPrices } from "./price-estimates.js";
 
 export { registerPriceServerAPI };
 export const PRICE_SERVER_NODE_ID = 0x2000;
@@ -17,6 +18,11 @@ export const PRICE_SERVER_NODE_ID = 0x2000;
 export const PRICE_SERVER_PASSCODE = 24681357;
 export const PRICE_SERVER_DISCRIMINATOR = 0xa00;
 export const PRICE_SERVER_PRODUCT_NAME = "Adectio Energy Tariff Server";
+
+/** Description given to forecast entries that are estimates rather than the published tariff */
+export const ESTIMATED_PRICE_DESCRIPTION = "Estimated";
+const MAX_PRICE_FORECAST_ENTRIES = 56;
+const PRICE_ESTIMATE_HOURS = 24;
 
 
 /**
@@ -54,6 +60,8 @@ export class PriceServer {
   private commodityPriceServer: CommodityPriceServer | null = null;
   private egcServer: ElectricalGridConditionsServer | null = null;
   private started = false;
+  /** Latest published (real) tariff, so the forecast can be republished when the carbon forecast changes */
+  private publishedPrices: Array<{ periodStart: number; periodEnd: number; price: number; priceLevel: string | number }> = [];
 
   constructor() {}
 
@@ -136,7 +144,7 @@ export class PriceServer {
       console.log(`[PriceServer] Discriminator: 0x${PRICE_SERVER_DISCRIMINATOR.toString(16)}`);
       console.log("[PriceServer] Device is now commissionable");
       console.log("[PriceServer] Clusters available:");
-      console.log("[PriceServer]   - CommodityPrice (0x0091) ✓");
+      console.log("[PriceServer]   - CommodityPrice (0x0095) ✓");
       console.log("[PriceServer]   - ElectricalGridConditions (0x00A0) ✓");
       console.log("[PriceServer] Update prices via: POST /api/price-server/set-price");
     } catch (error) {
@@ -181,6 +189,17 @@ export class PriceServer {
       qrPairingCode: commissioning?.pairingCodes?.qrPairingCode as string | undefined,
       commissioned: commissioning?.commissioned === true,
     };
+  }
+
+  /**
+   * Factory reset: removes every fabric so the price server becomes commissionable again.
+   * The node restarts with its configured endpoints; the fetchers repopulate prices on their next update.
+   */
+  async factoryReset(): Promise<void> {
+    if (!this.serverNode) throw new Error("The price server is not running.");
+    console.log("[PriceServer] Factory resetting...");
+    await this.serverNode.erase();
+    console.log("[PriceServer] Factory reset complete - commissionable again");
   }
 
   /**
@@ -266,25 +285,53 @@ export class PriceServer {
 
   /**
    * Set price forecast (for FORECAST feature)
+   *
+   * The published tariff is followed by estimated prices (from price history and the carbon forecast)
+   * up to the attribute's 56 entries, so consumers can plan beyond the published horizon.
    */
   async setPriceForecast(
     forecast: Array<{ periodStart: number; periodEnd: number; price: number; priceLevel: string | number }>
   ) {
+    this.publishedPrices = forecast;
+    await this.publishPriceForecast();
+  }
+
+  private async publishPriceForecast() {
     if (!this.tariffEndpoint) {
       console.warn("[PriceServer] Endpoint not available");
       return;
     }
+    const now = Math.floor(Date.now() / 1000);
+    const published = this.publishedPrices.filter(entry => entry.periodEnd > now);
+
+    let estimated: Array<{ periodStart: number; periodEnd: number; price: number }> = [];
+    try {
+      const estimate = await getEstimatedPrices("GBP", "uk", PRICE_ESTIMATE_HOURS);
+      const publishedUntil = Math.max(0, ...published.map(entry => entry.periodEnd));
+      estimated = estimate.estimates.filter(entry => entry.periodStart >= publishedUntil);
+    } catch (e) {
+      console.warn("[PriceServer] Unable to estimate prices:", e);
+    }
+
     try {
       await this.tariffEndpoint.act(async (agent: any) => {
         // PriceForecast is a list of CommodityPriceStruct, max 56 entries
-        agent.commodityPrice.state.priceForecast = forecast.slice(0, 56).map(entry => ({
-          periodStart: entry.periodStart,
-          periodEnd: entry.periodEnd,
-          price: entry.price,
-          priceLevel: mapPriceLevel(entry.priceLevel),
-        }));
+        agent.commodityPrice.state.priceForecast = [
+          ...published.map(entry => ({
+            periodStart: entry.periodStart,
+            periodEnd: entry.periodEnd,
+            price: entry.price,
+            priceLevel: mapPriceLevel(entry.priceLevel),
+          })),
+          ...estimated.map(entry => ({
+            periodStart: entry.periodStart,
+            periodEnd: entry.periodEnd,
+            price: entry.price,
+            description: ESTIMATED_PRICE_DESCRIPTION,
+          })),
+        ].slice(0, MAX_PRICE_FORECAST_ENTRIES);
       });
-      console.log(`[PriceServer] Updated PriceForecast: ${forecast.length} entries`);
+      console.log(`[PriceServer] Updated PriceForecast: ${published.length} published + ${estimated.length} estimated entries`);
     } catch (e) {
       console.warn("[PriceServer] Error updating PriceForecast:", e);
     }
@@ -314,6 +361,8 @@ export class PriceServer {
         });
       });
       console.log(`[PriceServer] Updated GridForecast: ${forecast.length} entries`);
+      // Estimated prices depend on the carbon forecast
+      if (this.publishedPrices.length > 0) await this.publishPriceForecast();
     } catch (e) {
       console.warn("[PriceServer] Error updating GridForecast:", e);
     }

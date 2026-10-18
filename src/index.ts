@@ -194,9 +194,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
             return;
         }
         const pairing = priceServer.getPairingInfo();
+        const onThisController = (await controller.listNodes()).some(node => node.role === "price-server");
         sendJson(response, 200, {
             pairing: {
                 ...pairing,
+                onThisController,
                 qrSvg: pairing.qrPairingCode
                     ? await QRCode.toString(pairing.qrPairingCode, { errorCorrectionLevel: "M", margin: 1, type: "svg", width: 192 })
                     : undefined,
@@ -210,6 +212,16 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
             sendJson(response, 503, { error: "The local price server is not running." });
             return;
         }
+        // A commissioned node stops advertising, so discovery would just time out
+        if (priceServer.getPairingInfo().commissioned) {
+            const onThisController = (await controller.listNodes()).some(node => node.role === "price-server");
+            sendJson(response, 409, {
+                error: onThisController
+                    ? "The price server is already commissioned on this controller."
+                    : "The price server is already commissioned by another controller, so it isn't discoverable. Reset it here, or open a commissioning window from that controller and use its pairing code.",
+            });
+            return;
+        }
         // Use the price server's own (distinct) passcode and discriminator so an EVSE can never be picked up instead
         const node = await controller.commission(
             String(PRICE_SERVER_PASSCODE),
@@ -217,6 +229,16 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
             "price-server",
         );
         sendJson(response, 201, { node, status: commissionedStatus(node) });
+        return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/price-server-reset") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        await priceServer.factoryReset();
+        sendJson(response, 200, { status: "Price server reset to factory defaults; it is commissionable again." });
         return;
     }
 
@@ -306,7 +328,8 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
 function commissionedStatus(node: { nodeId: string; role: string; productName?: string; linkStatus?: string }) {
     const label = { evse: "EVSE", "price-server": "price server", unknown: "device" }[node.role] ?? "device";
     const name = node.productName ? ` (${node.productName})` : "";
-    return [`Commissioned ${label} ${node.nodeId}${name}.`, node.linkStatus].filter(Boolean).join(" ");
+    const nodeId = `0x${BigInt(node.nodeId).toString(16).toUpperCase().padStart(4, "0")}`;
+    return [`Commissioned ${label} ${nodeId}${name}.`, node.linkStatus].filter(Boolean).join(" ");
 }
 
 function requiredString(value: unknown, name: string) {
@@ -339,8 +362,9 @@ function requiredChargingTargets(value: unknown) {
         const departureMinutes = requiredInteger(record.departureMinutes, `targets[${index}].departureMinutes`, 0, 1439);
         const targetSoC = optionalInteger(record.targetSoC, `targets[${index}].targetSoC`, 0, 100);
         const addedEnergy = optionalPositiveNumber(record.addedEnergy, `targets[${index}].addedEnergy`);
-        if ((targetSoC === undefined) === (addedEnergy === undefined)) {
-            throw new Error(`Target ${index + 1} must specify exactly one of targetSoC or addedEnergy.`);
+        // Both may be given: with SoC reporting, AddedEnergy is the fallback when the EV doesn't report its SoC
+        if (targetSoC === undefined && addedEnergy === undefined) {
+            throw new Error(`Target ${index + 1} must specify targetSoC and/or addedEnergy.`);
         }
         return { departureMinutes, targetSoC, addedEnergy };
     });

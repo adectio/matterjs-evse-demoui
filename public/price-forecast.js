@@ -79,7 +79,8 @@ async function loadPriceData() {
     statusEl.className = `status-badge ${CACHE_STATUS_CLASSES[data.cacheStatus] || ''}`;
 
     // Render chart
-    renderPriceChart(data.forecast, metadata);
+    renderPriceChart(data.forecast, metadata, data.estimated ?? []);
+    renderEstimateNote(data.estimated ?? [], data.estimateModel);
 
     priceContent.style.display = 'block';
     priceLoading.style.display = 'none';
@@ -148,7 +149,20 @@ async function loadGridData() {
   }
 }
 
-function renderPriceChart(forecast, metadata) {
+function renderEstimateNote(estimated, model) {
+  const note = document.getElementById('price-estimate-note');
+  if (!note) return;
+  note.hidden = estimated.length === 0 || !model;
+  if (note.hidden) return;
+  const carbon = {
+    fitted: 'adjusted for the grid carbon forecast (fitted to today\'s prices)',
+    prior: 'adjusted for the grid carbon forecast (assumed: 10% more carbon ≈ 5% higher price)',
+    none: 'not adjusted for carbon (no carbon forecast)',
+  }[model.carbonSlopeSource] ?? '';
+  note.textContent = `Dashed line: estimated prices after ${formatTime(model.publishedUntil)}, from the typical price at each time of day, ${carbon}. They are replaced when the tariff is published.`;
+}
+
+function renderPriceChart(forecast, metadata, estimated = []) {
   const chartCanvas = document.getElementById('priceChart');
   if (!chartCanvas) {
     console.error('priceChart canvas not found');
@@ -161,15 +175,22 @@ function renderPriceChart(forecast, metadata) {
     return;
   }
 
-  if (forecast.length === 0) {
+  if (forecast.length === 0 && estimated.length === 0) {
     console.warn('No price forecast data to display');
     return;
   }
 
-  const labels = forecast.map(p => formatTime(p.periodStart));
+  // Published prices are bars; estimates continue after them as a dashed line
+  const lastPublished = Math.max(0, ...forecast.map(p => p.periodStart));
+  const estimates = estimated.filter(p => p.periodStart > lastPublished);
+  const labels = [...forecast, ...estimates].map(p => formatTime(p.periodStart));
   const decimals = metadata.decimals || 2;
-  const prices = forecast.map(p => p.price ? p.price / Math.pow(10, decimals) : 0);
-  const colors = forecast.map(p => LEVEL_COLORS[p.priceLevel] || '#999');
+  const prices = [...forecast.map(p => p.price ? p.price / Math.pow(10, decimals) : 0), ...estimates.map(() => null)];
+  const estimatedPrices = [
+    ...forecast.map((p, i) => (i === forecast.length - 1 && estimates.length ? p.price / Math.pow(10, decimals) : null)),
+    ...estimates.map(p => p.price / Math.pow(10, decimals)),
+  ];
+  const colors = [...forecast.map(p => LEVEL_COLORS[p.priceLevel] || '#999'), ...estimates.map(() => '#999')];
 
   const backgroundColors = colors.map(c => c + '40'); // Add transparency
 
@@ -189,6 +210,18 @@ function renderPriceChart(forecast, metadata) {
           borderColor: colors,
           borderWidth: 2,
           borderRadius: 4,
+        },
+        {
+          type: 'line',
+          label: 'Estimated price',
+          data: estimatedPrices,
+          borderColor: '#f57c00',
+          borderDash: [6, 4],
+          borderWidth: 2,
+          pointRadius: 0,
+          stepped: 'middle',
+          spanGaps: false,
+          hidden: estimates.length === 0,
         },
       ],
     },

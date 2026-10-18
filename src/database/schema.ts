@@ -130,6 +130,31 @@ async function createTables(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_grid_forecast_period ON grid_conditions(forecast_id, period_start);
   `);
 
+  // History (kept for HISTORY_DAYS, independent of the forecast tables which are replaced on each fetch)
+  // One row per period; a later fetch of the same period replaces it
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS commodity_price_history (
+      source_id TEXT NOT NULL,
+      currency TEXT NOT NULL,
+      decimals INTEGER NOT NULL,
+      period_start INTEGER NOT NULL,
+      period_end INTEGER NOT NULL,
+      price INTEGER NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      PRIMARY KEY (source_id, period_start)
+    );
+    CREATE TABLE IF NOT EXISTS grid_carbon_history (
+      source_id TEXT NOT NULL,
+      region TEXT NOT NULL,
+      period_start INTEGER NOT NULL,
+      period_end INTEGER NOT NULL,
+      carbon_intensity INTEGER NOT NULL,
+      is_actual BOOLEAN NOT NULL DEFAULT 0,
+      recorded_at INTEGER NOT NULL,
+      PRIMARY KEY (source_id, region, period_start)
+    );
+  `);
+
   // Price Color Rules - thresholds for calculating price levels
   await db.exec(`
     CREATE TABLE IF NOT EXISTS price_color_rules (

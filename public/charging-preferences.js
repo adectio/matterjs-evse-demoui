@@ -9,7 +9,6 @@ const targetList = document.querySelector("#target-list");
 const result = document.querySelector("#preferences-result");
 const emptyState = document.querySelector("#preferences-empty-state");
 const status = document.querySelector("#status");
-const efficiencySettings = document.querySelector("#efficiency-settings");
 const efficiencyValue = document.querySelector("#efficiency-value");
 const efficiencyUnit = document.querySelector("#efficiency-unit");
 const selectedDays = new Set();
@@ -35,7 +34,16 @@ endpointSelect.addEventListener("change", loadPreferences);
 document.querySelector("#add-target").addEventListener("click", () => addTarget());
 document.querySelector("#save-targets").addEventListener("click", saveTargets);
 document.querySelector("#clear-targets").addEventListener("click", clearTargets);
-efficiencyUnit.addEventListener("change", updateRangeLabels);
+const EFFICIENCY_UNIT_KEY = "chargingPreferencesEfficiencyUnit";
+const KM_PER_MILE = 1.609344;
+try {
+    const savedUnit = localStorage.getItem(EFFICIENCY_UNIT_KEY);
+    if ([...efficiencyUnit.options].some(option => option.value === savedUnit)) efficiencyUnit.value = savedUnit;
+} catch {
+    // The remembered unit is only a convenience
+}
+let currentEfficiencyUnit = efficiencyUnit.value;
+efficiencyUnit.addEventListener("change", changeEfficiencyUnit);
 addTarget();
 loadNodes();
 
@@ -44,7 +52,9 @@ async function loadNodes() {
         const response = await fetch("/api/nodes");
         const { nodes, error } = await response.json();
         if (!response.ok) throw new Error(error ?? "Unable to list commissioned nodes.");
-        nodeSelect.replaceChildren(...nodes.map(node => new Option(`Node ${node.nodeId}`, node.nodeId)));
+        nodeSelect.replaceChildren(
+            ...nodes.map(node => new Option([`Node ${displayNodeId(node.nodeId)}`, node.productName].filter(Boolean).join(" · "), node.nodeId)),
+        );
         nodeSelect.disabled = nodes.length === 0;
         const selected = localStorage.getItem("selectedMatterNodeId");
         if (nodes.some(node => node.nodeId === selected)) nodeSelect.value = selected;
@@ -90,48 +100,52 @@ async function loadPreferences() {
     }
 }
 
-function addTarget() {
+/**
+ * Target rows follow the selected EVSE's SoC Reporting feature:
+ *  - "soc": Target SoC is mandatory and AddedEnergy is an optional fallback for EVs that don't report SoC
+ *  - "energy": AddedEnergy is the main target and TargetSoC may only be omitted or 100% (charge until full)
+ */
+function targetMode() {
+    return preferences?.supportsSoC === true ? "soc" : "energy";
+}
+
+function addTarget(departureTime = "07:00") {
     if (targetList.children.length >= 10) return;
     const row = document.createElement("div");
     row.className = "target-row";
-    row.innerHTML = `
-      <label>Departure time <input class="target-time" type="time" value="07:00" required /></label>
-      <label>Target type <select class="target-type"><option value="range">Added range</option><option value="soc">Target SoC</option></select></label>
-      <label class="target-value-label">Added range <input class="target-value" type="number" min="0.1" step="0.1" value="20" required /></label>`;
+    row.dataset.mode = targetMode();
+    if (row.dataset.mode === "soc") {
+        row.innerHTML = `
+          <label>Departure time <input class="target-time" type="time" required /></label>
+          <label>Target SoC (%) <input class="target-soc" type="number" min="1" max="100" step="1" value="80" required /></label>
+          <label><span class="range-label"></span> <input class="target-range" type="number" min="0.1" step="0.1" placeholder="Optional" /></label>
+          <p class="muted target-hint">The fallback range is used if the plugged-in EV doesn't report its SoC. Without it, such an EV is charged until full.</p>`;
+    } else {
+        row.innerHTML = `
+          <label>Departure time <input class="target-time" type="time" required /></label>
+          <label><span class="range-label"></span> <input class="target-range" type="number" min="0.1" step="0.1" value="20" /></label>
+          <label class="checkbox-label"><input class="target-full" type="checkbox" /> Also send Target SoC 100%</label>
+          <p class="muted target-hint">This EVSE can't read the EV's SoC. Leave the range empty and tick 100% to charge until the EV is full.</p>`;
+    }
+    row.querySelector(".target-time").value = departureTime;
+
     const remove = document.createElement("button");
     remove.className = "secondary remove-target";
     remove.type = "button";
     remove.textContent = "Remove";
-    remove.addEventListener("click", () => {
-        row.remove();
-        updateRangeSettingsVisibility();
-    });
-    row.append(remove);
-    row.querySelector(".target-type").addEventListener("change", () => updateTargetType(row));
+    remove.addEventListener("click", () => row.remove());
+    row.querySelector(".target-hint").before(remove);
     targetList.append(row);
-    applyTargetCapabilities(row);
     updateTargetValueLabel(row);
-    updateRangeSettingsVisibility();
 }
 
-function updateTargetType(row) {
-    const isRange = row.querySelector(".target-type").value === "range";
-    const input = row.querySelector(".target-value");
-    input.min = isRange ? "0.1" : "1";
-    input.max = isRange ? "" : "100";
-    input.step = isRange ? "0.1" : "1";
-    input.value = isRange ? "20" : "80";
-    updateTargetValueLabel(row);
-    updateRangeSettingsVisibility();
-}
-
-function applyTargetCapabilities(row) {
-    const type = row.querySelector(".target-type");
-    const rangeOption = type.querySelector('option[value="range"]');
-}
-
-function updateRangeSettingsVisibility() {
-    efficiencySettings.hidden = ![...targetList.querySelectorAll(".target-type")].some(select => select.value === "range");
+/** Rebuild the target rows (keeping departure times) when the selected EVSE has different capabilities */
+function applyTargetCapabilities() {
+    const rows = [...targetList.children];
+    if (rows.length > 0 && rows.every(row => row.dataset.mode === targetMode())) return;
+    const departureTimes = rows.map(row => row.querySelector(".target-time").value);
+    targetList.replaceChildren();
+    for (const departureTime of departureTimes.length ? departureTimes : ["07:00"]) addTarget(departureTime);
 }
 
 function updateRangeLabels() {
@@ -139,9 +153,8 @@ function updateRangeLabels() {
 }
 
 function updateTargetValueLabel(row) {
-    const label = row.querySelector(".target-value-label");
-    const isRange = row.querySelector(".target-type").value === "range";
-    label.firstChild.textContent = isRange ? `Added range (${rangeUnitLabel()}) ` : "Target SoC ";
+    const prefix = row.dataset.mode === "soc" ? "Fallback added range" : "Added range";
+    row.querySelector(".range-label").textContent = `${prefix} (${rangeUnitLabel()})`;
 }
 
 function rangeUnitLabel() {
@@ -192,14 +205,32 @@ function collectTargets() {
     return [...targetList.children].map(row => {
         const [hours, minutes] = row.querySelector(".target-time").value.split(":").map(Number);
         if (!Number.isInteger(hours) || !Number.isInteger(minutes)) throw new Error("Each target needs a departure time.");
-        const value = Number(row.querySelector(".target-value").value);
-        if (!Number.isFinite(value) || value <= 0) throw new Error("Each target needs a positive value.");
-        if (row.querySelector(".target-type").value === "soc") {
-            if (!Number.isInteger(value) || value > 100) throw new Error("Target SoC must be a whole percentage from 1 to 100.");
-            return { departureMinutes: hours * 60 + minutes, targetSoC: value };
+        const target = { departureMinutes: hours * 60 + minutes };
+
+        const rangeText = row.querySelector(".target-range").value.trim();
+        if (rangeText !== "") {
+            const range = Number(rangeText);
+            if (!Number.isFinite(range) || range <= 0) throw new Error("Added range must be a positive number.");
+            const rangeKm = range * kmPerRangeUnit(efficiencyUnit.value);
+            target.addedEnergy = Math.round((rangeKm / rangePerKwh()) * 1_000_000);
         }
-        return { departureMinutes: hours * 60 + minutes, addedEnergy: Math.round((value / rangePerKwh()) * 1_000_000) };
+
+        if (row.dataset.mode === "soc") {
+            target.targetSoC = validSoC(Number(row.querySelector(".target-soc").value));
+        } else if (row.querySelector(".target-full").checked) {
+            target.targetSoC = 100;
+        }
+
+        if (target.targetSoC === undefined && target.addedEnergy === undefined) {
+            throw new Error("Each target needs an added range, or Target SoC 100% to charge until full.");
+        }
+        return target;
     });
+}
+
+function validSoC(value) {
+    if (!Number.isInteger(value) || value < 1 || value > 100) throw new Error("Target SoC must be a whole percentage from 1 to 100.");
+    return value;
 }
 
 function convertEfficiency() {
@@ -208,11 +239,47 @@ function convertEfficiency() {
     return Math.round(rangePerKwh() * 1000);
 }
 
+/** Vehicle efficiency in km/kWh from the efficiency field */
 function rangePerKwh() {
-    const value = Number(efficiencyValue.value);
-    if (efficiencyUnit.value === "mi-per-kwh") return value * 1.609344;
-    if (efficiencyUnit.value === "km-per-kwh") return value;
-    return 100 / value;
+    return kmPerKwhFrom(Number(efficiencyValue.value), efficiencyUnit.value);
+}
+
+function kmPerKwhFrom(value, unit) {
+    if (unit === "mi-per-kwh") return value * KM_PER_MILE;
+    if (unit === "km-per-kwh") return value;
+    return 100 / value; // kWh per 100 km
+}
+
+function efficiencyIn(kmPerKwh, unit) {
+    if (unit === "mi-per-kwh") return kmPerKwh / KM_PER_MILE;
+    if (unit === "km-per-kwh") return kmPerKwh;
+    return 100 / kmPerKwh;
+}
+
+/** Range targets are entered in miles for mi/kWh and in km otherwise */
+function kmPerRangeUnit(unit) {
+    return unit === "mi-per-kwh" ? KM_PER_MILE : 1;
+}
+
+/** Convert the efficiency and any entered ranges so they keep their meaning in the new unit */
+function changeEfficiencyUnit() {
+    const previous = currentEfficiencyUnit;
+    const next = efficiencyUnit.value;
+    const efficiency = Number(efficiencyValue.value);
+    if (Number.isFinite(efficiency) && efficiency > 0) {
+        efficiencyValue.value = efficiencyIn(kmPerKwhFrom(efficiency, previous), next).toFixed(2);
+    }
+    const factor = kmPerRangeUnit(previous) / kmPerRangeUnit(next);
+    for (const input of targetList.querySelectorAll(".target-range")) {
+        if (input.value.trim() !== "") input.value = (Number(input.value) * factor).toFixed(1);
+    }
+    currentEfficiencyUnit = next;
+    try {
+        localStorage.setItem(EFFICIENCY_UNIT_KEY, next);
+    } catch {
+        // The remembered unit is only a convenience
+    }
+    updateRangeLabels();
 }
 
 function renderPreferences() {
@@ -220,11 +287,10 @@ function renderPreferences() {
     emptyState.hidden = preferences !== undefined;
     if (preferences === undefined) return;
     if (preferences.approximateEvEfficiency !== null) {
-        efficiencyValue.value = (preferences.approximateEvEfficiency / 1000).toFixed(2);
-        efficiencyUnit.value = "km-per-kwh";
-        updateRangeLabels();
+        // Show the EVSE's value (stored as km/kWh x 1000) in the user's chosen unit
+        efficiencyValue.value = efficiencyIn(preferences.approximateEvEfficiency / 1000, efficiencyUnit.value).toFixed(2);
     }
-    for (const row of targetList.children) applyTargetCapabilities(row);
+    applyTargetCapabilities();
     if (preferences.schedules.length === 0) {
         result.textContent = "No charging targets are stored on this EVSE.";
         return;
@@ -237,12 +303,22 @@ function renderPreferences() {
         const list = document.createElement("ul");
         for (const target of schedule.targets) {
             const item = document.createElement("li");
-            item.textContent = `${formatMinutes(target.departureMinutes)} — ${target.targetSoC !== null ? `${target.targetSoC}% SoC` : formatAddedEnergy(target.addedEnergy)}`;
+            item.textContent = `${formatMinutes(target.departureMinutes)} — ${formatTarget(target)}`;
             list.append(item);
         }
         card.append(heading, list);
         result.append(card);
     }
+}
+
+function formatTarget(target) {
+    if (!preferences.supportsSoC) {
+        // Without SoC reporting, AddedEnergy takes precedence and TargetSoC can only be 100%
+        return target.addedEnergy !== null ? formatAddedEnergy(target.addedEnergy) : "Charge until full";
+    }
+    if (target.targetSoC === null) return formatAddedEnergy(target.addedEnergy);
+    const fallback = target.addedEnergy !== null ? formatAddedEnergy(target.addedEnergy) : "charge until full";
+    return `${target.targetSoC}% SoC (${fallback} if the EV doesn't report SoC)`;
 }
 
 function formatMinutes(value) {
@@ -254,11 +330,17 @@ function formatAddedEnergy(value) {
     const kwh = value / 1_000_000;
     if (preferences.approximateEvEfficiency === null) return `${kwh.toFixed(2)} kWh added`;
     const km = kwh * (preferences.approximateEvEfficiency / 1000);
-    return `${kwh.toFixed(2)} kWh added (≈ ${km.toFixed(1)} km)`;
+    const range = km / kmPerRangeUnit(efficiencyUnit.value);
+    return `${kwh.toFixed(2)} kWh added (≈ ${range.toFixed(1)} ${rangeUnitLabel()})`;
 }
 
 function targetsUrl() {
     return `/api/evses/${nodeSelect.value}/${endpointSelect.value}/charging-targets`;
+}
+
+/** Node IDs are shown in hex, as in Matter tooling (the API still uses decimal) */
+function displayNodeId(nodeId) {
+    return `0x${BigInt(nodeId).toString(16).toUpperCase().padStart(4, "0")}`;
 }
 
 function showStatus(message, isError = false) {

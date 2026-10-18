@@ -2,6 +2,7 @@ import axios from 'axios';
 import { getDatabase } from '../database/schema.js';
 import { calculateCarbonLevel, updateCarbonLevelForForecast } from '../database/colors.js';
 import { setCachedData, recordCacheMiss } from '../database/cache.js';
+import { BACKFILL_THRESHOLD_DAYS, HISTORY_DAYS, carbonHistoryDays, recordCarbonHistory } from '../database/history.js';
 
 const CARBON_API_URL = 'https://api.carbonintensity.org.uk';
 const CACHE_TTL_MINUTES = 30;
@@ -14,11 +15,16 @@ interface CarbonData {
   from: string;
   to: string;
   intensity: {
-    actual: number;
+    actual: number | null;
     forecast: number;
     index: string;
   };
 }
+
+/** The national range endpoint returns at most 14 days per request */
+const BACKFILL_WINDOW_DAYS = 14;
+const HISTORY_SOURCE = 'uk-carbon-intensity';
+const HISTORY_REGION = 'uk';
 
 interface CarbonIntensityResponse {
   data: CarbonData[];
@@ -50,7 +56,12 @@ export async function fetchUKCarbonIntensity(postcode?: string): Promise<void> {
         throw new Error('No data returned from Carbon Intensity API');
       }
 
+      await recordCarbonHistory(HISTORY_SOURCE, HISTORY_REGION, data.map(toCarbonHistoryRow));
       await storeGridConditionsForecast(data, 'uk', postcode);
+      // Past measured values (national only) give the price estimator a month to learn from
+      if (!postcode) {
+        await backfillCarbonHistory().catch((error) => console.warn('Carbon history backfill failed:', error));
+      }
       return;
     } catch (error) {
       attempt++;
@@ -67,6 +78,33 @@ export async function fetchUKCarbonIntensity(postcode?: string): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
+}
+
+function toCarbonHistoryRow(point: CarbonData) {
+  const actual = point.intensity.actual;
+  return {
+    periodStart: Math.floor(new Date(point.from).getTime() / 1000),
+    periodEnd: Math.floor(new Date(point.to).getTime() / 1000),
+    carbonIntensity: Math.round(actual ?? point.intensity.forecast),
+    isActual: actual !== null && actual !== undefined,
+  };
+}
+
+async function backfillCarbonHistory(): Promise<void> {
+  if ((await carbonHistoryDays(HISTORY_SOURCE, HISTORY_REGION)) >= BACKFILL_THRESHOLD_DAYS) {
+    return;
+  }
+  const end = Date.now();
+  let recorded = 0;
+  for (let from = end - HISTORY_DAYS * 24 * 3600 * 1000; from < end; from += BACKFILL_WINDOW_DAYS * 24 * 3600 * 1000) {
+    const to = Math.min(from + BACKFILL_WINDOW_DAYS * 24 * 3600 * 1000, end);
+    const url = `${CARBON_API_URL}/intensity/${new Date(from).toISOString()}/${new Date(to).toISOString()}`;
+    const response = await axios.get(url, { timeout: 30000 });
+    const points: CarbonData[] = Array.isArray(response.data?.data) ? response.data.data : [];
+    await recordCarbonHistory(HISTORY_SOURCE, HISTORY_REGION, points.map(toCarbonHistoryRow));
+    recorded += points.length;
+  }
+  console.log(`Backfilled carbon intensity history with ${recorded} periods`);
 }
 
 async function queryUKCarbonIntensityAPI(postcode?: string): Promise<CarbonData[] | null> {

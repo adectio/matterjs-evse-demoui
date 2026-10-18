@@ -3,6 +3,7 @@ import { AccessControlClient } from "@matter/main/behaviors/access-control";
 import { BindingClient } from "@matter/main/behaviors/binding";
 import { CommodityPriceClient } from "@matter/main/behaviors/commodity-price";
 import { DescriptorClient } from "@matter/main/behaviors/descriptor";
+import { DeviceEnergyManagementClient } from "@matter/main/behaviors/device-energy-management";
 import { ElectricalGridConditionsClient } from "@matter/main/behaviors/electrical-grid-conditions";
 import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
@@ -10,6 +11,7 @@ import { OperationalCredentialsClient } from "@matter/main/behaviors/operational
 import {
     AccessControl,
     CommodityPrice,
+    DeviceEnergyManagementCluster,
     ElectricalGridConditions,
     ElectricalPowerMeasurementCluster,
     EnergyEvseCluster,
@@ -25,6 +27,7 @@ import {
     QrPairingCodeCodec,
 } from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
+import { randomInt } from "node:crypto";
 
 export type NodeRole = "evse" | "price-server" | "unknown";
 
@@ -45,6 +48,10 @@ export type CommissionableDevice = {
     deviceType?: number;
     role: NodeRole;
 };
+
+/** New node IDs are drawn from this short range so they stay readable (shown as 0x0100-0xFFFF) */
+const MIN_ASSIGNED_NODE_ID = 0x0100;
+const MAX_ASSIGNED_NODE_ID = 0xffff;
 
 /** Matter device type IDs used to label commissionable devices before commissioning */
 const EVSE_DEVICE_TYPE = 0x050c;
@@ -75,6 +82,29 @@ export type EvseStatus = {
     activePower: number | null;
     voltage: number | null;
     activeCurrent: number | null;
+    forecast: ForecastView | null;
+};
+
+/** Device Energy Management Forecast, with times in Unix seconds and power/energy in mW/mWh */
+export type ForecastView = {
+    forecastId: number;
+    startTime: number;
+    endTime: number;
+    earliestStartTime: number | null;
+    latestEndTime: number | null;
+    activeSlotNumber: number | null;
+    forecastUpdateReason: number;
+    slots: ForecastSlotView[];
+};
+
+export type ForecastSlotView = {
+    startTime: number;
+    duration: number;
+    nominalPower: number | null;
+    minPower: number | null;
+    maxPower: number | null;
+    nominalEnergy: number | null;
+    isPausable: boolean | null;
 };
 
 export type ChargingTargetView = {
@@ -109,6 +139,12 @@ export class MatterControllerService {
     #controller: CommissioningController | undefined;
     #evseChangeListeners = new Set<() => void>();
     #subscribedNodeIds = new Set<string>();
+    /**
+     * Latest DEM Forecast per "nodeId/endpointId", taken from attribute reports. matter.js 0.17 doesn't refresh its
+     * cached views of list elements when a remote value replaces a list, so reading slots via the client state can
+     * return stale entries (e.g. the first slot of an earlier forecast).
+     */
+    #forecasts = new Map<string, DemForecast | null>();
 
     async start() {
         if (this.#controller !== undefined) return;
@@ -189,10 +225,13 @@ export class MatterControllerService {
             return result;
         }
 
+        // Commissioning has succeeded at this point, so a linking failure is reported rather than thrown
         if (role === "price-server") {
             result.linkStatus = await this.linkAllPriceConsumers();
         } else if (consumesPrices) {
-            result.linkStatus = await this.linkPriceConsumer(nodeId.toString());
+            result.linkStatus = await this.linkPriceConsumer(nodeId.toString()).catch(
+                error => `Linking to the price server failed: ${errorMessage(error)}`,
+            );
         }
         return result;
     }
@@ -270,11 +309,25 @@ export class MatterControllerService {
         return `Bound endpoint ${bindingEndpoint.number} to price server ${priceServerNodeId} endpoint ${tariffEndpointNumber}.`;
     }
 
+    /**
+     * A random (but short) node ID. Sequential IDs get reused once a node is forgotten locally, and a forgotten
+     * device that was never decommissioned still answers CASE for its old ID on this fabric - so the commissioner
+     * would finish commissioning against the wrong device (failing with NoFailSafe).
+     */
+    private newNodeId() {
+        const inUse = new Set(this.controller.getCommissionedNodes().map(nodeId => BigInt(nodeId)));
+        for (;;) {
+            const candidate = BigInt(randomInt(MIN_ASSIGNED_NODE_ID, MAX_ASSIGNED_NODE_ID + 1));
+            if (!inUse.has(candidate)) return NodeId(candidate);
+        }
+    }
+
     private async commissionNode(pairing: PairingDetails) {
         const options: NodeCommissioningOptions = {
             commissioning: {
                 regulatoryLocation: GeneralCommissioning.RegulatoryLocationType.IndoorOutdoor,
                 regulatoryCountryCode: "GB",
+                nodeId: this.newNodeId(),
             },
             discovery: {
                 identifierData: pairing.identifierData,
@@ -306,6 +359,9 @@ export class MatterControllerService {
             const powerMeterEndpoints = endpoints.filter(
                 endpoint => endpoint.maybeStateOf(ElectricalPowerMeasurementClient) !== undefined,
             );
+            const demEndpoints = endpoints.filter(
+                endpoint => endpoint.maybeStateOf(DeviceEnergyManagementClient) !== undefined,
+            );
             for (const endpoint of endpoints) {
                 const state = endpoint.maybeStateOf(EnergyEvseClient);
                 if (state === undefined) continue;
@@ -313,6 +369,9 @@ export class MatterControllerService {
                     powerMeterEndpoints.find(candidate => candidate === endpoint || isDescendantOf(candidate, endpoint)) ??
                     (powerMeterEndpoints.length === 1 ? powerMeterEndpoints[0] : undefined);
                 const powerMeasurement = powerMeterEndpoint?.maybeStateOf(ElectricalPowerMeasurementClient);
+                const demEndpoint =
+                    demEndpoints.find(candidate => candidate === endpoint || isDescendantOf(candidate, endpoint)) ??
+                    (demEndpoints.length === 1 ? demEndpoints[0] : undefined);
                 statuses.push({
                     nodeId: nodeId.toString(),
                     endpointId: endpoint.number,
@@ -335,6 +394,13 @@ export class MatterControllerService {
                     activePower: numberOrNull(powerMeasurement?.activePower),
                     voltage: numberOrNull(powerMeasurement?.voltage),
                     activeCurrent: numberOrNull(powerMeasurement?.activeCurrent),
+                    forecast: forecastView(
+                        demEndpoint === undefined
+                            ? undefined
+                            : this.#forecasts.has(`${nodeId}/${demEndpoint.number}`)
+                              ? this.#forecasts.get(`${nodeId}/${demEndpoint.number}`)
+                              : demEndpoint.maybeStateOf(DeviceEnergyManagementClient)?.forecast,
+                    ),
                 });
             }
         }
@@ -451,6 +517,15 @@ export class MatterControllerService {
         }
         if (days.length === 0) throw new Error("Select at least one day.");
         if (targets.length === 0 || targets.length > 10) throw new Error("Add between one and ten charging targets.");
+        const supportsSoC = endpoint.maybeFeaturesOf(EnergyEvseClient)?.soCReporting === true;
+        if (supportsSoC && targets.some(target => target.targetSoC === undefined)) {
+            throw new Error(
+                "This EVSE supports SoC reporting, so every charging target needs a Target SoC (added energy is only used if the EV doesn't report its SoC).",
+            );
+        }
+        if (!supportsSoC && targets.some(target => target.targetSoC !== undefined && target.targetSoC !== 100)) {
+            throw new Error("This EVSE does not support SoC reporting, so Target SoC must be omitted or 100%.");
+        }
         if (approximateEvEfficiency !== undefined) {
             await endpoint.setStateOf(EnergyEvseClient, { approximateEvEfficiency });
         }
@@ -492,6 +567,9 @@ export class MatterControllerService {
     async forceForget(nodeId: string) {
         await this.controller.removeNode(parseNodeId(nodeId), false);
         this.#subscribedNodeIds.delete(nodeId);
+        for (const key of this.#forecasts.keys()) {
+            if (key.startsWith(`${nodeId}/`)) this.#forecasts.delete(key);
+        }
     }
 
     async cleanLocalContext() {
@@ -506,6 +584,7 @@ export class MatterControllerService {
         await this.#controller?.close();
         this.#controller = undefined;
         this.#subscribedNodeIds.clear();
+        this.#forecasts.clear();
     }
 
     get controller() {
@@ -517,8 +596,15 @@ export class MatterControllerService {
 
     private subscribeToEvseChanges(node: Awaited<ReturnType<CommissioningController["getNode"]>>, nodeId: string) {
         if (this.#subscribedNodeIds.has(nodeId)) return;
-        node.events.attributeChanged.on(({ path }) => {
-            if (path.clusterId === EnergyEvseCluster.id || path.clusterId === ElectricalPowerMeasurementCluster.id) {
+        node.events.attributeChanged.on(({ path, value }) => {
+            if (path.clusterId === DeviceEnergyManagementCluster.id && path.attributeName === "forecast") {
+                this.#forecasts.set(`${nodeId}/${path.endpointId}`, value as DemForecast | null);
+            }
+            if (
+                path.clusterId === EnergyEvseCluster.id ||
+                path.clusterId === ElectricalPowerMeasurementCluster.id ||
+                path.clusterId === DeviceEnergyManagementCluster.id
+            ) {
                 for (const listener of this.#evseChangeListeners) listener();
             }
         });
@@ -675,6 +761,53 @@ function parseNodeId(nodeId: string) {
         throw new Error("Invalid Matter node ID.");
     }
     return NodeId(nodeId);
+}
+
+/** The fields of a DEM ForecastStruct (as read from the client state) used by the UI */
+type DemForecast = {
+    readonly forecastId: number;
+    readonly startTime: number;
+    readonly endTime: number;
+    readonly earliestStartTime?: number | null;
+    readonly latestEndTime?: number;
+    readonly activeSlotNumber: number | null;
+    readonly forecastUpdateReason: number;
+    readonly slots: readonly {
+        readonly defaultDuration: number;
+        readonly nominalPower?: number | bigint;
+        readonly minPower?: number | bigint;
+        readonly maxPower?: number | bigint;
+        readonly nominalEnergy?: number | bigint;
+        readonly slotIsPausable?: boolean;
+    }[];
+};
+
+function forecastView(forecast: DemForecast | null | undefined): ForecastView | null {
+    if (forecast === null || forecast === undefined) return null;
+    let slotStart = forecast.startTime;
+    return {
+        forecastId: forecast.forecastId,
+        startTime: forecast.startTime,
+        endTime: forecast.endTime,
+        earliestStartTime: numberOrNull(forecast.earliestStartTime),
+        latestEndTime: numberOrNull(forecast.latestEndTime),
+        activeSlotNumber: numberOrNull(forecast.activeSlotNumber),
+        forecastUpdateReason: forecast.forecastUpdateReason,
+        // Slots are back to back from the forecast start
+        slots: forecast.slots.map(slot => {
+            const startTime = slotStart;
+            slotStart += slot.defaultDuration;
+            return {
+                startTime,
+                duration: slot.defaultDuration,
+                nominalPower: numberOrNull(slot.nominalPower),
+                minPower: numberOrNull(slot.minPower),
+                maxPower: numberOrNull(slot.maxPower),
+                nominalEnergy: numberOrNull(slot.nominalEnergy),
+                isPausable: slot.slotIsPausable ?? null,
+            };
+        }),
+    };
 }
 
 function numberOrNull(value: number | bigint | null | undefined) {

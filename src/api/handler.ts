@@ -1,3 +1,4 @@
+import { getEstimatedPrices } from "../price-server/price-estimates.js";
 import { ServerResponse, IncomingMessage } from "node:http";
 import {
   getPriceForecast,
@@ -36,16 +37,30 @@ export async function handleApiRequest(
   if (method === "GET" && pathname === "/api/commodity-price/forecast") {
     const currency = url.searchParams.get("currency") || "GBP";
     const hours = parseInt(url.searchParams.get("hours") || "24");
+    const from = parseFromParam(url);
 
-    const forecast = await getPriceForecast(currency, hours);
+    const forecast = await getPriceForecast(currency, hours, from);
     const meta = await getLatestPriceForecastMetadata(currency);
     const status = await getCacheStatus(`kraken-prices`);
 
     console.log(`Price forecast query: currency=${currency}, hours=${hours}, results=${forecast.length}, metadata=`, meta);
 
+    // Estimated prices beyond the published tariff (from price history and the carbon forecast)
+    let estimated: Array<{ periodStart: number; periodEnd: number; price: number }> = [];
+    let estimateModel = null;
+    try {
+      const estimate = await getEstimatedPrices(currency, "uk", hours);
+      estimated = estimate.estimates;
+      estimateModel = { ...estimate.model, publishedUntil: estimate.publishedUntil };
+    } catch (error) {
+      console.warn("Price estimate failed:", error);
+    }
+
     sendJson(response, 200, {
       timestamp: new Date().toISOString(),
       forecast,
+      estimated,
+      estimateModel,
       metadata: meta,
       cacheStatus: status,
       periodCount: forecast.length,
@@ -72,8 +87,9 @@ export async function handleApiRequest(
   if (method === "GET" && pathname === "/api/grid-conditions/forecast") {
     const region = url.searchParams.get("region") || "uk";
     const hours = parseInt(url.searchParams.get("hours") || "48");
+    const from = parseFromParam(url);
 
-    const forecast = await getGridConditionsForecast(region, hours);
+    const forecast = await getGridConditionsForecast(region, hours, from);
     const meta = await getLatestGridForecastMetadata(region);
     const status = await getCacheStatus(`${region}-carbon-intensity`);
 
@@ -190,4 +206,12 @@ export async function handleApiRequest(
 function sendJson(response: ServerResponse, status: number, body: unknown) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
+}
+
+/** Optional `from` (Unix seconds) to include periods before now, limited to the last day */
+function parseFromParam(url: URL): number | undefined {
+  const value = Number(url.searchParams.get("from"));
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const now = Math.floor(Date.now() / 1000);
+  return Math.max(value, now - 24 * 3600);
 }

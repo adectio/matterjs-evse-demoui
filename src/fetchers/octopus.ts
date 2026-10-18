@@ -2,9 +2,14 @@ import axios from 'axios';
 import { getDatabase } from '../database/schema.js';
 import { calculatePriceLevel, updatePriceLevelForForecast } from '../database/colors.js';
 import { setCachedData, recordCacheMiss } from '../database/cache.js';
+import { BACKFILL_THRESHOLD_DAYS, HISTORY_DAYS, priceHistoryDays, recordPriceHistory } from '../database/history.js';
 
 const OCTOPUS_API_URL = 'https://api.octopus.energy/v1/products';
 const CACHE_TTL_MINUTES = 60; // Cache for 1 hour - rates are published daily
+/** Older rates are only kept in the history table, not in the current forecast */
+const FORECAST_LOOKBACK_SECONDS = 2 * 24 * 3600;
+/** Follow at most this many pages of results (1500 rates each) */
+const MAX_PAGES = 3;
 const RETRY_CONFIG = {
   maxRetries: 3,
   backoffMs: 2000,
@@ -50,13 +55,36 @@ export async function fetchOctopusAgileRates(
   let attempt = 0;
   while (attempt < RETRY_CONFIG.maxRetries) {
     try {
-      const rates = await queryOctopusAPI(apiKey, productCode, regionCode);
+      // Fill the history with a month of past rates when it is short (e.g. first run)
+      const backfill = (await priceHistoryDays('octopus')) < BACKFILL_THRESHOLD_DAYS;
+      const periodFrom = backfill ? new Date(Date.now() - HISTORY_DAYS * 24 * 3600 * 1000).toISOString() : undefined;
+      const rates = await queryOctopusAPI(apiKey, productCode, regionCode, periodFrom);
 
       if (!rates) {
         throw new Error('No rates data returned from Octopus API');
       }
 
-      await storePriceForecast(rates, productCode, regionCode);
+      const halfHourly = rates.filter(isHalfHourlyRate);
+      await recordPriceHistory(
+        'octopus',
+        'GBP',
+        2,
+        halfHourly.map((rate) => ({
+          periodStart: Math.floor(new Date(rate.valid_from).getTime() / 1000),
+          periodEnd: Math.floor(new Date(rate.valid_to).getTime() / 1000),
+          price: Math.round(rate.value_inc_vat * 100),
+        }))
+      );
+      if (backfill) {
+        console.log(`Backfilled Octopus price history with ${halfHourly.length} rates`);
+      }
+
+      const recentCutoff = Date.now() - FORECAST_LOOKBACK_SECONDS * 1000;
+      await storePriceForecast(
+        rates.filter((rate) => new Date(rate.valid_to).getTime() > recentCutoff),
+        productCode,
+        regionCode
+      );
       return;
     } catch (error) {
       attempt++;
@@ -78,21 +106,34 @@ export async function fetchOctopusAgileRates(
 async function queryOctopusAPI(
   apiKey: string,
   productCode: string,
-  regionCode: string
+  regionCode: string,
+  periodFrom?: string
 ): Promise<OctopusRate[] | null> {
   // Use the public endpoint that doesn't require authentication
   const tariffCode = `E-1R-${productCode}-${regionCode}`;
-  const url = `https://api.octopus.energy/v1/products/${productCode}/electricity-tariffs/${tariffCode}/standard-unit-rates/`;
+  let url: string | null = `https://api.octopus.energy/v1/products/${productCode}/electricity-tariffs/${tariffCode}/standard-unit-rates/`;
+  const params: Record<string, string | number> | undefined = periodFrom
+    ? { period_from: periodFrom, page_size: 1500 }
+    : undefined;
 
-  const response = await axios.get(url, {
-    timeout: 10000,
-  });
-
-  if (!response.data?.results) {
-    throw new Error('Invalid Octopus API response format');
+  // A backfill can span more than one page
+  const results: OctopusRate[] = [];
+  for (let page = 0; url && page < MAX_PAGES; page++) {
+    const response: { data: { results?: OctopusRate[]; next?: string | null } } = await axios.get(url, {
+      timeout: 30000,
+      params: page === 0 ? params : undefined,
+    });
+    if (!response.data?.results) {
+      throw new Error('Invalid Octopus API response format');
+    }
+    results.push(...response.data.results);
+    url = periodFrom ? response.data.next ?? null : null;
   }
+  return results;
+}
 
-  return response.data.results;
+function isHalfHourlyRate(rate: OctopusRate) {
+  return new Date(rate.valid_to).getTime() - new Date(rate.valid_from).getTime() === 30 * 60 * 1000;
 }
 
 async function storePriceForecast(

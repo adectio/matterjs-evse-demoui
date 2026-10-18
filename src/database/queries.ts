@@ -1,12 +1,18 @@
 import { getDatabase } from './schema.js';
+import { getCarbonHistory } from './history.js';
 import { CommodityPriceStruct, GridConditionsStruct, CommodityPriceStruct as CPStruct } from './types.js';
 
+/**
+ * Prices from `from` (default now; periods still in progress are included) until `hours` from now.
+ */
 export async function getPriceForecast(
   currency: string,
-  hours: number = 24
+  hours: number = 24,
+  from?: number
 ): Promise<CommodityPriceStruct[]> {
   const db = await getDatabase();
   const now = Math.floor(Date.now() / 1000);
+  const fromSeconds = Math.min(from ?? now, now);
   const futureSeconds = hours * 3600;
 
   const prices = await db.all(
@@ -22,11 +28,11 @@ export async function getPriceForecast(
      FROM commodity_prices cp
      JOIN commodity_price_forecasts cpf ON cp.forecast_id = cpf.id
      WHERE cpf.currency = ?
-      AND cp.period_start >= ?
+      AND COALESCE(cp.period_end, cp.period_start + 1800) > ?  -- include the period in progress
       AND cp.period_start <= ?
       AND cpf.valid_until > ?
      ORDER BY cp.period_start ASC`,
-    [currency, now, now + futureSeconds, now]
+    [currency, fromSeconds, now + futureSeconds, now]
   ) as Array<any>;
 
   return prices.map((p) => ({
@@ -78,12 +84,18 @@ export async function getCurrentPrice(currency: string): Promise<CommodityPriceS
   };
 }
 
+/**
+ * Grid conditions from `from` (default now; periods still in progress are included) until `hours` from
+ * now. Past periods that are no longer in the latest forecast come from the carbon history.
+ */
 export async function getGridConditionsForecast(
   region: string,
-  hours: number = 48
+  hours: number = 48,
+  from?: number
 ): Promise<GridConditionsStruct[]> {
   const db = await getDatabase();
   const now = Math.floor(Date.now() / 1000);
+  const fromSeconds = Math.min(from ?? now, now);
   const futureSeconds = hours * 3600;
 
   const conditions = await db.all(
@@ -99,14 +111,14 @@ export async function getGridConditionsForecast(
      FROM grid_conditions gc
      JOIN grid_conditions_forecasts gcf ON gc.forecast_id = gcf.id
      WHERE gcf.region = ?
-      AND gc.period_start >= ?
+      AND COALESCE(gc.period_end, gc.period_start + 1800) > ?  -- include the period in progress
       AND gc.period_start <= ?
       AND gcf.valid_until > ?
      ORDER BY gc.period_start ASC`,
-    [region, now, now + futureSeconds, now]
+    [region, fromSeconds, now + futureSeconds, now]
   ) as Array<any>;
 
-  return conditions.map((c) => ({
+  const forecast: GridConditionsStruct[] = conditions.map((c) => ({
     periodStart: c.period_start,
     periodEnd: c.period_end,
     gridCarbonIntensity: c.grid_carbon_intensity,
@@ -116,6 +128,20 @@ export async function getGridConditionsForecast(
     localGenerationAvailable: c.local_generation_available,
     description: c.description,
   }));
+
+  const forecastStart = forecast.length > 0 ? forecast[0].periodStart : now;
+  if (fromSeconds >= forecastStart) {
+    return forecast;
+  }
+  const history: GridConditionsStruct[] = (await getCarbonHistory(region))
+    .filter((h) => h.periodEnd > fromSeconds && h.periodStart < forecastStart)
+    .map((h) => ({
+      periodStart: h.periodStart,
+      periodEnd: h.periodEnd,
+      gridCarbonIntensity: h.carbonIntensity,
+      description: h.isActual ? 'Actual' : 'Forecast',
+    }));
+  return [...history, ...forecast];
 }
 
 export async function getCurrentGridConditions(region: string): Promise<GridConditionsStruct | null> {
