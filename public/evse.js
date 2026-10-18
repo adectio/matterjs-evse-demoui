@@ -643,6 +643,7 @@ function displayNodeId(nodeId) {
 }
 
 function nodeLabel(node) {
+    if (node.nodeName) return `${node.nodeName} (${displayNodeId(node.nodeId)})`;
     return [`Node ${displayNodeId(node.nodeId)}`, node.productName].filter(Boolean).join(" · ");
 }
 

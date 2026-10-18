@@ -52,9 +52,7 @@ async function loadNodes() {
         const response = await fetch("/api/nodes");
         const { nodes, error } = await response.json();
         if (!response.ok) throw new Error(error ?? "Unable to list commissioned nodes.");
-        nodeSelect.replaceChildren(
-            ...nodes.map(node => new Option([`Node ${displayNodeId(node.nodeId)}`, node.productName].filter(Boolean).join(" · "), node.nodeId)),
-        );
+        nodeSelect.replaceChildren(...nodes.map(node => new Option(nodeDisplayName(node), node.nodeId)));
         nodeSelect.disabled = nodes.length === 0;
         const selected = localStorage.getItem("selectedMatterNodeId");
         if (nodes.some(node => node.nodeId === selected)) nodeSelect.value = selected;
@@ -336,6 +334,12 @@ function formatAddedEnergy(value) {
 
 function targetsUrl() {
     return `/api/evses/${nodeSelect.value}/${endpointSelect.value}/charging-targets`;
+}
+
+function nodeDisplayName(node) {
+    return node.nodeName
+        ? `${node.nodeName} (${displayNodeId(node.nodeId)})`
+        : [`Node ${displayNodeId(node.nodeId)}`, node.productName].filter(Boolean).join(" · ");
 }
 
 /** Node IDs are shown in hex, as in Matter tooling (the API still uses decimal) */

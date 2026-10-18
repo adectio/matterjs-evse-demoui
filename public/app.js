@@ -120,6 +120,12 @@ function renderNode(node) {
     item.className = "node-row";
     const info = document.createElement("div");
     info.className = "node-info";
+    if (node.nodeName) {
+        const name = document.createElement("span");
+        name.className = "node-name";
+        name.textContent = node.nodeName;
+        info.append(name);
+    }
     const id = document.createElement("code");
     id.textContent = displayNodeId(node.nodeId);
     const details = document.createElement("small");
@@ -138,10 +144,20 @@ function renderNode(node) {
         });
     }
 
+    let timeSource = document.createElement("span");
+    if (node.supportsTrustedTimeSource) {
+        timeSource = document.createElement("button");
+        timeSource.className = "secondary";
+        timeSource.textContent = "Set trusted time source";
+        timeSource.addEventListener("click", async () => {
+            await runAction("Setting trusted time source…", `/api/nodes/${node.nodeId}/set-time-source`);
+        });
+    }
+
     const decommission = document.createElement("button");
     decommission.textContent = "Decommission";
     decommission.addEventListener("click", async () => {
-        if (!confirm(`Decommission ${displayNodeId(node.nodeId)} from this Matter fabric?`)) return;
+        if (!confirm(`Decommission ${nodeDisplayName(node)} from this Matter fabric?`)) return;
         await runAction("Decommissioning device…", `/api/nodes/${node.nodeId}/decommission`);
     });
 
@@ -156,12 +172,16 @@ function renderNode(node) {
     forget.className = "secondary";
     forget.textContent = "Force forget";
     forget.addEventListener("click", async () => {
-        if (!confirm(`Forget ${displayNodeId(node.nodeId)} locally? The device will retain this Matter fabric.`)) return;
+        if (!confirm(`Forget ${nodeDisplayName(node)} locally? The device will retain this Matter fabric.`)) return;
         await runAction("Forgetting device locally…", `/api/nodes/${node.nodeId}/force-forget`);
     });
 
-    item.append(info, link, openWindow, decommission, forget);
+    item.append(info, link, timeSource, openWindow, decommission, forget);
     return item;
+}
+
+function nodeDisplayName(node) {
+    return node.nodeName ? `${node.nodeName} (${displayNodeId(node.nodeId)})` : `node ${displayNodeId(node.nodeId)}`;
 }
 
 async function openCommissioningWindow(nodeId) {

@@ -3,6 +3,7 @@ const STORAGE_PREFIX = 'evse-config-';
 
 document.addEventListener('DOMContentLoaded', async () => {
   loadConfigFromStorage();
+  await loadCustomTariff();
   await refreshSystemStatus();
   // Refresh system status every 30 seconds
   setInterval(refreshSystemStatus, 30 * 1000);
@@ -34,12 +35,6 @@ function loadConfigFromStorage() {
   if (ukPostcode) {
     document.getElementById('uk-postcode').value = ukPostcode;
   }
-
-  // Load custom tariff
-  const customTariff = localStorage.getItem(STORAGE_PREFIX + 'custom-tariff');
-  if (customTariff) {
-    loadCustomTariff(JSON.parse(customTariff));
-  }
 }
 
 function savePriceSources() {
@@ -70,109 +65,137 @@ function saveGridSources() {
   // TODO: Send to backend to save in database
 }
 
-function addTariffPeriod() {
-  const periodsContainer = document.getElementById('tariff-periods');
-  const periodCount = periodsContainer.children.length;
+const PRICE_LEVELS = ['Very low', 'Low', 'Medium', 'High', 'Very high'];
 
+// Prices are stored in 1/100 of a penny/cent, as the price server publishes them
+const PRICE_SCALE = 100;
+
+function addTariffPeriod(period) {
+  const periodsContainer = document.getElementById('tariff-periods');
   const periodDiv = document.createElement('div');
   periodDiv.className = 'tariff-period';
-  periodDiv.dataset.index = periodCount;
 
-  const startHour = Math.floor((periodCount * 30) / 60) % 24;
-  const startMin = (periodCount * 30) % 60;
+  // A new period starts 30 minutes after the last one
+  const last = periodsContainer.lastElementChild?.querySelector('.period-start').value;
+  const startMinutes = period?.startMinutes ?? (last ? (minutesFromTime(last) + 30) % (24 * 60) : 0);
 
-  periodDiv.innerHTML = `
-    <input type="time" value="${String(startHour).padStart(2, '0')}:${String(startMin).padStart(2, '0')}"
-           class="period-start" />
-    <input type="number" step="0.001" placeholder="Price" class="period-price" />
-    <input type="text" placeholder="Description (optional)" class="period-description" />
-    <button type="button" class="btn-danger" onclick="removeTariffPeriod(${periodCount})">Remove</button>
-  `;
+  const start = document.createElement('input');
+  start.type = 'time';
+  start.className = 'period-start';
+  start.value = `${String(Math.floor(startMinutes / 60)).padStart(2, '0')}:${String(startMinutes % 60).padStart(2, '0')}`;
 
+  const price = document.createElement('input');
+  price.type = 'number';
+  price.step = '0.01';
+  price.placeholder = 'Price (p/kWh)';
+  price.className = 'period-price';
+  if (period) price.value = period.price / PRICE_SCALE;
+
+  const level = document.createElement('select');
+  level.className = 'period-level';
+  level.append(new Option('Level: auto', ''));
+  PRICE_LEVELS.forEach((label, value) => level.append(new Option(label, String(value))));
+  level.value = period?.priceLevel == null ? '' : String(period.priceLevel);
+
+  const description = document.createElement('input');
+  description.type = 'text';
+  description.placeholder = 'Description (optional)';
+  description.className = 'period-description';
+  description.value = period?.description ?? '';
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-danger';
+  remove.textContent = 'Remove';
+  remove.addEventListener('click', () => periodDiv.remove());
+
+  periodDiv.append(start, price, level, description, remove);
   periodsContainer.appendChild(periodDiv);
 }
 
-function removeTariffPeriod(index) {
-  const periodDiv = document.querySelector(`[data-index="${index}"]`);
-  if (periodDiv) {
-    periodDiv.remove();
-  }
+function minutesFromTime(value) {
+  const [hours, minutes] = value.split(':').map(Number);
+  return hours * 60 + minutes;
 }
 
-function saveCustomTariff() {
-  const name = document.getElementById('tariff-name').value;
+async function saveCustomTariff() {
+  const name = document.getElementById('tariff-name').value.trim();
   const currency = document.getElementById('tariff-currency').value;
-  const decimals = parseInt(document.getElementById('tariff-decimals').value);
-
   if (!name) {
     showStatus('Please enter a tariff name', 'error');
     return;
   }
 
   const periods = [];
-  document.querySelectorAll('.tariff-period').forEach((periodDiv) => {
+  for (const periodDiv of document.querySelectorAll('.tariff-period')) {
     const start = periodDiv.querySelector('.period-start').value;
-    const price = parseFloat(periodDiv.querySelector('.period-price').value);
-    const description = periodDiv.querySelector('.period-description').value;
-
-    if (!start || !price) {
-      showStatus('Please fill in all period data', 'error');
+    const price = periodDiv.querySelector('.period-price').value;
+    if (!start || price === '' || !Number.isFinite(Number(price))) {
+      showStatus('Every period needs a start time and a price', 'error');
       return;
     }
-
-    const [hours, minutes] = start.split(':').map(Number);
-    const startMinutes = hours * 60 + minutes;
-    const endMinutes = (startMinutes + 30) % (24 * 60);
-
+    const level = periodDiv.querySelector('.period-level').value;
     periods.push({
-      startMinutes,
-      endMinutes,
-      price: Math.round(price * Math.pow(10, decimals)),
-      description,
+      startMinutes: minutesFromTime(start),
+      price: Math.round(Number(price) * PRICE_SCALE),
+      priceLevel: level === '' ? null : Number(level),
+      description: periodDiv.querySelector('.period-description').value,
     });
-  });
+  }
+  if (periods.length === 0) {
+    showStatus('Add at least one price period', 'error');
+    return;
+  }
 
-  const tariff = { name, currency, decimals, periods };
-  localStorage.setItem(STORAGE_PREFIX + 'custom-tariff', JSON.stringify(tariff));
-
-  showStatus('Custom tariff saved', 'success');
-
-  // TODO: Send to backend to save in database
+  try {
+    const response = await fetch(`${API_BASE}/price-server/custom-tariff`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, currency, periods }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      showStatus(`Could not save the tariff: ${data.error}`, 'error');
+      return;
+    }
+    renderCustomTariff(data.tariff);
+    showStatus('Custom tariff saved and published by the price server', 'success');
+  } catch (error) {
+    showStatus(`Error: ${error.message}`, 'error');
+  }
 }
 
-function loadCustomTariff(tariff) {
+async function loadCustomTariff() {
+  try {
+    const response = await fetch(`${API_BASE}/price-server/custom-tariff`);
+    if (!response.ok) return;
+    const { tariff } = await response.json();
+    if (tariff) renderCustomTariff(tariff);
+  } catch (error) {
+    console.error('Failed to load custom tariff:', error);
+  }
+}
+
+function renderCustomTariff(tariff) {
   document.getElementById('tariff-name').value = tariff.name;
   document.getElementById('tariff-currency').value = tariff.currency;
-  document.getElementById('tariff-decimals').value = tariff.decimals;
-
-  const periodsContainer = document.getElementById('tariff-periods');
-  periodsContainer.innerHTML = '';
-
-  tariff.periods.forEach((period, index) => {
-    const hours = Math.floor(period.startMinutes / 60);
-    const minutes = period.startMinutes % 60;
-    const price = period.price / Math.pow(10, tariff.decimals);
-
-    const periodDiv = document.createElement('div');
-    periodDiv.className = 'tariff-period';
-    periodDiv.dataset.index = index;
-    periodDiv.innerHTML = `
-      <input type="time" value="${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}"
-             class="period-start" />
-      <input type="number" step="0.001" placeholder="Price" class="period-price" value="${price}" />
-      <input type="text" placeholder="Description (optional)" class="period-description" value="${period.description || ''}" />
-      <button type="button" class="btn-danger" onclick="removeTariffPeriod(${index})">Remove</button>
-    `;
-    periodsContainer.appendChild(periodDiv);
-  });
+  document.getElementById('tariff-periods').innerHTML = '';
+  tariff.periods.forEach((period) => addTariffPeriod(period));
 }
 
-function clearCustomTariff() {
-  if (confirm('Are you sure you want to clear the custom tariff?')) {
-    localStorage.removeItem(STORAGE_PREFIX + 'custom-tariff');
+async function clearCustomTariff() {
+  if (!confirm('Are you sure you want to clear the custom tariff? The price server will go back to fetched prices.')) return;
+  try {
+    const response = await fetch(`${API_BASE}/price-server/custom-tariff`, { method: 'DELETE' });
+    if (!response.ok) {
+      showStatus(`Could not clear the tariff: ${(await response.json()).error}`, 'error');
+      return;
+    }
     document.getElementById('tariff-name').value = '';
     document.getElementById('tariff-periods').innerHTML = '';
     showStatus('Custom tariff cleared', 'success');
+  } catch (error) {
+    showStatus(`Error: ${error.message}`, 'error');
   }
 }
 

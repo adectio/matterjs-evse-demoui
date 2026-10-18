@@ -3,6 +3,7 @@ import { getDatabase } from '../database/schema.js';
 import { calculatePriceLevel, updatePriceLevelForForecast } from '../database/colors.js';
 import { setCachedData, recordCacheMiss } from '../database/cache.js';
 import { BACKFILL_THRESHOLD_DAYS, HISTORY_DAYS, priceHistoryDays, recordPriceHistory } from '../database/history.js';
+import { priceLevelNumber } from '../price-server/schedule.js';
 
 const OCTOPUS_API_URL = 'https://api.octopus.energy/v1/products';
 const CACHE_TTL_MINUTES = 60; // Cache for 1 hour - rates are published daily
@@ -218,42 +219,22 @@ async function storePriceForecast(
     `Stored ${halfHourlyRates.length} Octopus Agile rate points for region ${regionCode}`
   );
 
-  // Update price server if available
+  // Update price server if available; it advances CurrentPrice through the schedule itself
   try {
     const priceServer = (globalThis as any).__priceServer;
     if (priceServer) {
-      // Find current and upcoming prices
-      const now = Math.floor(Date.now() / 1000);
-      const currentRate = halfHourlyRates.find(rate => {
-        const start = Math.floor(new Date(rate.valid_from).getTime() / 1000);
-        const end = Math.floor(new Date(rate.valid_to).getTime() / 1000);
-        return start <= now && now < end;
-      });
-
-      if (currentRate) {
-        const price = Math.round(currentRate.value_inc_vat * 100);
-        const priceLevel = await calculatePriceLevel(price, currency, decimals, tariffUnit);
-        // Get actual period times from Octopus API (convert to Unix timestamps)
-        const periodStart = Math.floor(new Date(currentRate.valid_from).getTime() / 1000);
-        const periodEnd = Math.floor(new Date(currentRate.valid_to).getTime() / 1000);
-        // GBP = 826 (ISO 4217), decimals=2 means 0.01 GBP units (pence)
-        await priceServer.setCurrentPrice(price, priceLevel, periodStart, periodEnd, 826, decimals);
-      }
-
-      // Build forecast from the current period onwards (Octopus returns newest first)
-      const forecast = halfHourlyRates
-        .map(rate => ({
+      const entries = [];
+      for (const rate of halfHourlyRates) {
+        const price = Math.round(rate.value_inc_vat * 100);
+        entries.push({
           periodStart: Math.floor(new Date(rate.valid_from).getTime() / 1000),
           periodEnd: Math.floor(new Date(rate.valid_to).getTime() / 1000),
-          price: Math.round(rate.value_inc_vat * 100),
-          priceLevel: 0,
-        }))
-        .filter(entry => entry.periodEnd > now)
-        .sort((a, b) => a.periodStart - b.periodStart);
-
-      if (forecast.length > 0) {
-        await priceServer.setPriceForecast(forecast);
+          price,
+          priceLevel: priceLevelNumber(await calculatePriceLevel(price, currency, decimals, tariffUnit)),
+        });
       }
+      // Prices are in 1/100 pence, i.e. 4 decimal points of GBP (826)
+      await priceServer.setFetchedSchedule({ currency: 826, decimalPoints: 4, entries });
     }
   } catch (e) {
     console.warn('Error updating price server from Octopus data:', e);

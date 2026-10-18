@@ -1,4 +1,5 @@
 import { Environment, Seconds } from "@matter/main";
+import { BasicInformationClient } from "@matter/main/behaviors/basic-information";
 import { AccessControlClient } from "@matter/main/behaviors/access-control";
 import { BindingClient } from "@matter/main/behaviors/binding";
 import { CommodityPriceClient } from "@matter/main/behaviors/commodity-price";
@@ -8,6 +9,7 @@ import { ElectricalGridConditionsClient } from "@matter/main/behaviors/electrica
 import { ElectricalPowerMeasurementClient } from "@matter/main/behaviors/electrical-power-measurement";
 import { EnergyEvseClient } from "@matter/main/behaviors/energy-evse";
 import { OperationalCredentialsClient } from "@matter/main/behaviors/operational-credentials";
+import { TimeSynchronizationClient } from "@matter/main/behaviors/time-synchronization";
 import {
     AccessControl,
     CommodityPrice,
@@ -16,6 +18,7 @@ import {
     ElectricalPowerMeasurementCluster,
     EnergyEvseCluster,
     GeneralCommissioning,
+    TimeSynchronization,
 } from "@matter/main/clusters";
 import {
     ClusterId,
@@ -33,9 +36,12 @@ export type NodeRole = "evse" | "price-server" | "unknown";
 
 export type CommissionedNode = {
     nodeId: string;
+    nodeName?: string;
     role: NodeRole;
     /** True when the node has CommodityPrice or ElectricalGridConditions client clusters (EVSE, appliance, ...) */
     consumesPrices: boolean;
+    /** True when the node's Time Synchronization cluster has the TimeSyncClient feature, so it accepts a trusted time source */
+    supportsTrustedTimeSource: boolean;
     productName?: string;
     commissionedAt?: string;
     linkStatus?: string;
@@ -59,6 +65,9 @@ const ELECTRICAL_ENERGY_TARIFF_DEVICE_TYPE = 0x0513;
 
 /** Clusters on the price server that price consumers are bound to and granted View access on */
 const PRICE_CLUSTER_IDS: ClusterId[] = [CommodityPrice.Cluster.id, ElectricalGridConditions.Cluster.id];
+
+/** The price server hosts the trusted time source on its root endpoint */
+const TIME_SOURCE_ENDPOINT = EndpointNumber(0);
 
 export type EvseStatus = {
     nodeId: string;
@@ -105,6 +114,15 @@ export type ForecastSlotView = {
     maxPower: number | null;
     nominalEnergy: number | null;
     isPausable: boolean | null;
+};
+
+export type CompanionNode = {
+    nodeId: string;
+    vendorName?: string;
+    productName?: string;
+    nodeName?: string;
+    hasSubscription: boolean;
+    endpoints: { endpointId: number; deviceTypes: number[] }[];
 };
 
 export type ChargingTargetView = {
@@ -165,11 +183,14 @@ export class MatterControllerService {
     async listNodes(): Promise<CommissionedNode[]> {
         const nodes: CommissionedNode[] = [];
         for (const nodeId of this.controller.getCommissionedNodes()) {
+            const basicInformation = (await this.controller.getNode(nodeId)).basicInformation;
             const node = await this.controller.getNode(nodeId);
             nodes.push({
                 nodeId: nodeId.toString(),
+                nodeName: basicInformation?.nodeLabel || basicInformation?.productName || undefined,
                 role: roleOf(node),
                 consumesPrices: priceClientEndpointsOf(node).length > 0,
+                supportsTrustedTimeSource: supportsTrustedTimeSource(node),
                 productName: productNameOf(node),
             });
         }
@@ -208,16 +229,19 @@ export class MatterControllerService {
                 nodeId: nodeId.toString(),
                 role: "unknown",
                 consumesPrices: false,
+                supportsTrustedTimeSource: false,
                 linkStatus: "Commissioned, but could not connect to read its endpoints.",
             };
         }
 
         const role = roleOf(node);
         const consumesPrices = priceClientEndpointsOf(node).length > 0;
+        const usesTimeSource = supportsTrustedTimeSource(node);
         const result: CommissionedNode = {
             nodeId: nodeId.toString(),
             role,
             consumesPrices,
+            supportsTrustedTimeSource: usesTimeSource,
             productName: productNameOf(node),
         };
         if (expectedRole !== undefined && role !== expectedRole) {
@@ -225,14 +249,23 @@ export class MatterControllerService {
             return result;
         }
 
-        // Commissioning has succeeded at this point, so a linking failure is reported rather than thrown
+        // Commissioning has succeeded at this point, so linking failures are reported rather than thrown
+        const statuses = [];
         if (role === "price-server") {
-            result.linkStatus = await this.linkAllPriceConsumers();
-        } else if (consumesPrices) {
-            result.linkStatus = await this.linkPriceConsumer(nodeId.toString()).catch(
-                error => `Linking to the price server failed: ${errorMessage(error)}`,
-            );
+            statuses.push(await this.linkAllPriceConsumers(), await this.setAllTrustedTimeSources());
+        } else {
+            if (consumesPrices) {
+                statuses.push(
+                    await this.linkPriceConsumer(nodeId.toString()).catch(
+                        error => `Linking to the price server failed: ${errorMessage(error)}`,
+                    ),
+                );
+            }
+            if (usesTimeSource) {
+                statuses.push(await this.setTrustedTimeSource(nodeId.toString()).catch(errorMessage));
+            }
         }
+        if (statuses.length) result.linkStatus = statuses.join(" ");
         return result;
     }
 
@@ -244,6 +277,64 @@ export class MatterControllerService {
             statuses.push(`${consumerNodeId}: ${await this.linkPriceConsumer(consumerNodeId).catch(errorMessage)}`);
         }
         return statuses.length ? statuses.join(" ") : "No price consumers commissioned yet to link.";
+    }
+
+    /** Point every commissioned node that supports it at the trusted time source, e.g. after the price server is commissioned */
+    async setAllTrustedTimeSources(): Promise<string> {
+        const nodeIds = (await this.listNodes()).filter(n => n.supportsTrustedTimeSource).map(n => n.nodeId);
+        const statuses = [];
+        for (const nodeId of nodeIds) {
+            statuses.push(`${nodeId}: ${await this.setTrustedTimeSource(nodeId).catch(errorMessage)}`);
+        }
+        return statuses.length ? statuses.join(" ") : "No time sync clients commissioned yet.";
+    }
+
+    /**
+     * Set the price server's Time Synchronization cluster as the node's trusted time source and grant the node View
+     * access to it on the price server.
+     */
+    async setTrustedTimeSource(nodeId: string): Promise<string> {
+        const priceServerNodeId = (await this.listNodes()).find(n => n.role === "price-server")?.nodeId;
+        if (priceServerNodeId === undefined) {
+            return "No price server commissioned yet; the trusted time source will be set when one is.";
+        }
+
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the device within 30 seconds; the trusted time source was not set.");
+        }
+        if (!supportsTrustedTimeSource(node)) {
+            return "The device's Time Synchronization cluster does not support a trusted time source.";
+        }
+
+        const priceNode = await this.controller.getNode(parseNodeId(priceServerNodeId));
+        if (!(await ensureConnected(priceNode))) {
+            throw new Error("Could not connect to the price server within 30 seconds; the trusted time source was not set.");
+        }
+        if (priceNode.node.maybeStateOf(TimeSynchronizationClient) === undefined) {
+            throw new Error("The price server does not expose Time Synchronization; restart it to pick up the time source.");
+        }
+
+        // Grant access first so the node can read UTCTime as soon as it has the trusted time source
+        await grantView(priceNode, BigInt(nodeId), [
+            { endpoint: TIME_SOURCE_ENDPOINT, cluster: TimeSynchronization.Cluster.id },
+        ]);
+
+        const priceNodeId = NodeId(BigInt(priceServerNodeId));
+        const current = node.node.stateOf(TimeSynchronizationClient).trustedTimeSource;
+        if (
+            current?.nodeId === priceNodeId &&
+            current.endpoint === TIME_SOURCE_ENDPOINT &&
+            current.fabricIndex === currentFabricIndexOf(node)
+        ) {
+            return `Already using price server ${priceServerNodeId} as the trusted time source.`;
+        }
+        await node.node.act("set trusted time source", agent =>
+            agent.get(TimeSynchronizationClient).setTrustedTimeSource({
+                trustedTimeSource: { nodeId: priceNodeId, endpoint: TIME_SOURCE_ENDPOINT },
+            }),
+        );
+        return `Trusted time source set to price server ${priceServerNodeId} endpoint ${TIME_SOURCE_ENDPOINT}.`;
     }
 
     /**
@@ -289,7 +380,11 @@ export class MatterControllerService {
         const tariffEndpointNumber = EndpointNumber(tariffEndpoint.number);
 
         // Grant access first so the consumer can subscribe as soon as it sees the binding
-        await grantPriceServerView(priceNode, BigInt(consumerNodeId), tariffEndpointNumber);
+        await grantView(
+            priceNode,
+            BigInt(consumerNodeId),
+            PRICE_CLUSTER_IDS.map(cluster => ({ endpoint: tariffEndpointNumber, cluster })),
+        );
 
         const fabricIndex = currentFabricIndexOf(consumerNode);
         const existingBindings = bindingEndpoint.stateOf(BindingClient).binding;
@@ -405,6 +500,44 @@ export class MatterControllerService {
             }
         }
         return statuses;
+    }
+
+    async listCompanionNodes(): Promise<CompanionNode[]> {
+        const nodes: CompanionNode[] = [];
+        for (const nodeId of this.controller.getCommissionedNodes()) {
+            const node = await this.controller.getNode(nodeId);
+            const basicInformation = node.basicInformation;
+            nodes.push({
+                nodeId: nodeId.toString(),
+                vendorName: basicInformation?.vendorName,
+                productName: basicInformation?.productName,
+                nodeName: basicInformation?.nodeLabel || undefined,
+                hasSubscription: node.isConnected,
+                endpoints: [...node.node.endpoints].flatMap(endpoint => {
+                    const descriptor = endpoint.maybeStateOf(DescriptorClient);
+                    if (descriptor === undefined) return [];
+                    return [
+                        {
+                            endpointId: Number(endpoint.number),
+                            deviceTypes: descriptor.deviceTypeList.map(entry => Number(entry.deviceType)),
+                        },
+                    ];
+                }),
+            });
+        }
+        return nodes;
+    }
+
+    async renameNode(nodeId: string, name: string) {
+        if (name.length > 32) {
+            throw new Error("The node name must be 32 characters or fewer.");
+        }
+        const node = await this.controller.getNode(parseNodeId(nodeId));
+        if (!(await ensureConnected(node))) {
+            throw new Error("Could not connect to the device within 30 seconds. The node was not renamed.");
+        }
+        await node.node.setStateOf(BasicInformationClient, { nodeLabel: name });
+        return `Node renamed to "${name}".`;
     }
 
     onEvseChanged(listener: () => void) {
@@ -648,6 +781,14 @@ function priceClientEndpointsOf(node: PairedNode) {
         .filter(({ clusters }) => clusters.length > 0);
 }
 
+/** Whether the node's root Time Synchronization cluster has TimeSyncClient; the price server is the source, not a client */
+function supportsTrustedTimeSource(node: PairedNode) {
+    return (
+        roleOf(node) !== "price-server" &&
+        node.node.maybeFeaturesOf(TimeSynchronizationClient)?.timeSyncClient === true
+    );
+}
+
 function roleOfDeviceType(deviceType: number | undefined): NodeRole {
     if (deviceType === EVSE_DEVICE_TYPE) return "evse";
     if (deviceType === ELECTRICAL_ENERGY_TARIFF_DEVICE_TYPE) return "price-server";
@@ -671,39 +812,43 @@ function currentFabricIndexOf(node: PairedNode) {
 }
 
 /**
- * Add the consumer as a subject of a single shared View entry targeting the price clusters, keeping all other ACL
- * entries (including our own Administer entry) untouched.
+ * Add the subject to a single shared View entry with exactly these targets (one entry per purpose, e.g. price clusters
+ * or time source), keeping all other ACL entries (including our own Administer entry) untouched.
  */
-async function grantPriceServerView(priceNode: PairedNode, consumerNodeId: bigint, endpoint: EndpointNumber) {
-    const fabricIndex = currentFabricIndexOf(priceNode);
-    const acl = priceNode.node.stateOf(AccessControlClient).acl.map(entry => ({
+async function grantView(
+    serverNode: PairedNode,
+    subjectNodeId: bigint,
+    targets: { endpoint: EndpointNumber; cluster: ClusterId }[],
+) {
+    const fabricIndex = currentFabricIndexOf(serverNode);
+    const acl = serverNode.node.stateOf(AccessControlClient).acl.map(entry => ({
         privilege: entry.privilege,
         authMode: entry.authMode,
         subjects: entry.subjects,
         targets: entry.targets,
         fabricIndex: entry.fabricIndex,
     }));
-    const isPriceViewEntry = (entry: (typeof acl)[number]) =>
+    const isMatchingViewEntry = (entry: (typeof acl)[number]) =>
         entry.privilege === AccessControl.AccessControlEntryPrivilege.View &&
         entry.authMode === AccessControl.AccessControlEntryAuthMode.Case &&
-        entry.targets?.length === PRICE_CLUSTER_IDS.length &&
-        entry.targets.every(t => t.endpoint === endpoint && t.cluster !== null && PRICE_CLUSTER_IDS.includes(t.cluster));
+        entry.targets?.length === targets.length &&
+        entry.targets.every(t => targets.some(target => t.endpoint === target.endpoint && t.cluster === target.cluster));
 
-    const existing = acl.find(isPriceViewEntry);
-    if (existing?.subjects?.some(subject => BigInt(subject) === consumerNodeId)) return;
+    const existing = acl.find(isMatchingViewEntry);
+    if (existing?.subjects?.some(subject => BigInt(subject) === subjectNodeId)) return;
 
     if (existing !== undefined) {
-        existing.subjects = [...(existing.subjects ?? []), NodeId(consumerNodeId)];
+        existing.subjects = [...(existing.subjects ?? []), NodeId(subjectNodeId)];
     } else {
         acl.push({
             privilege: AccessControl.AccessControlEntryPrivilege.View,
             authMode: AccessControl.AccessControlEntryAuthMode.Case,
-            subjects: [NodeId(consumerNodeId)],
-            targets: PRICE_CLUSTER_IDS.map(cluster => ({ cluster, endpoint, deviceType: null })),
+            subjects: [NodeId(subjectNodeId)],
+            targets: targets.map(({ cluster, endpoint }) => ({ cluster, endpoint, deviceType: null })),
             fabricIndex,
         });
     }
-    await priceNode.node.setStateOf(AccessControlClient, { acl });
+    await serverNode.node.setStateOf(AccessControlClient, { acl });
 }
 
 function errorMessage(error: unknown) {

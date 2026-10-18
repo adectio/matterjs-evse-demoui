@@ -228,6 +228,12 @@ async function createTables(): Promise<void> {
     );
   `);
 
+  // price_level was added after the table was first created
+  const periodColumns = await db.all('PRAGMA table_info(custom_tariff_periods)');
+  if (!periodColumns.some((column: any) => column.name === 'price_level')) {
+    await db.exec('ALTER TABLE custom_tariff_periods ADD COLUMN price_level INTEGER');
+  }
+
   // Insert default color rules if they don't exist
   await insertDefaultColorRules();
 }
