@@ -8,7 +8,8 @@ import { CommodityPriceStruct, GridConditionsStruct, CommodityPriceStruct as CPS
 export async function getPriceForecast(
   currency: string,
   hours: number = 24,
-  from?: number
+  from?: number,
+  sourceId?: string
 ): Promise<CommodityPriceStruct[]> {
   const db = await getDatabase();
   const now = Math.floor(Date.now() / 1000);
@@ -31,8 +32,9 @@ export async function getPriceForecast(
       AND COALESCE(cp.period_end, cp.period_start + 1800) > ?  -- include the period in progress
       AND cp.period_start <= ?
       AND cpf.valid_until > ?
+      AND (? IS NULL OR cpf.source_id = ?)
      ORDER BY cp.period_start ASC`,
-    [currency, fromSeconds, now + futureSeconds, now]
+    [currency, fromSeconds, now + futureSeconds, now, sourceId ?? null, sourceId ?? null]
   ) as Array<any>;
 
   return prices.map((p) => ({
@@ -46,7 +48,7 @@ export async function getPriceForecast(
   }));
 }
 
-export async function getCurrentPrice(currency: string): Promise<CommodityPriceStruct | null> {
+export async function getCurrentPrice(currency: string, sourceId?: string): Promise<CommodityPriceStruct | null> {
   const db = await getDatabase();
   const now = Math.floor(Date.now() / 1000);
 
@@ -66,9 +68,10 @@ export async function getCurrentPrice(currency: string): Promise<CommodityPriceS
       AND cp.period_start <= ?
       AND (cp.period_end IS NULL OR cp.period_end > ?)
       AND cpf.valid_until > ?
+      AND (? IS NULL OR cpf.source_id = ?)
      ORDER BY cp.period_start DESC
      LIMIT 1`,
-    [currency, now, now, now]
+    [currency, now, now, now, sourceId ?? null, sourceId ?? null]
   ) as any;
 
   if (!price) return null;
@@ -183,7 +186,7 @@ export async function getCurrentGridConditions(region: string): Promise<GridCond
   };
 }
 
-export async function getLatestPriceForecastMetadata(currency: string): Promise<any> {
+export async function getLatestPriceForecastMetadata(currency: string, sourceId?: string): Promise<any> {
   const db = await getDatabase();
 
   const meta = await db.get(
@@ -197,10 +200,10 @@ export async function getLatestPriceForecastMetadata(currency: string): Promise<
       fetched_at,
       valid_until
      FROM commodity_price_forecasts
-     WHERE currency = ?
+     WHERE currency = ? AND (? IS NULL OR source_id = ?)
      ORDER BY fetched_at DESC
      LIMIT 1`,
-    [currency]
+    [currency, sourceId ?? null, sourceId ?? null]
   );
 
   return meta;

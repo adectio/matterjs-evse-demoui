@@ -130,6 +130,15 @@ async function createTables(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_grid_forecast_period ON grid_conditions(forecast_id, period_start);
   `);
 
+  // Application settings (e.g. the selected price source), as JSON values
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
   // History (kept for HISTORY_DAYS, independent of the forecast tables which are replaced on each fetch)
   // One row per period; a later fetch of the same period replaces it
   await db.exec(`

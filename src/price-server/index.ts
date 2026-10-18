@@ -11,6 +11,8 @@ import { ServerNode } from "@matter/node";
 import { ElectricalEnergyTariffDevice } from "@matter/node/devices";
 import { CommodityPriceServer, ElectricalGridConditionsServer } from "@matter/node/behaviors";
 import { getCustomTariff, CustomTariff } from "../database/custom-tariff.js";
+import { getPriceSourceSettings, PriceSourceId, priceSourceName } from "../database/settings.js";
+import type { TariffSourceId } from "../fetchers/tariff-sources.js";
 import { registerPriceServerAPI } from "./api.js";
 import { TimeSourceServer } from "./behaviors/time-source.js";
 import { getEstimatedPrices } from "./price-estimates.js";
@@ -46,9 +48,11 @@ export class PriceServer {
   private serverNode: ServerNode | null = null;
   private tariffEndpoint: any = null;
   private started = false;
-  /** A saved custom tariff takes precedence over fetched (Octopus) prices */
+  /** Which prices are published: a fetched tariff or the custom tariff (from the price source settings) */
+  private priceSource: PriceSourceId = "octopus";
   private customTariff: CustomTariff | null = null;
-  private fetchedSchedule: PriceSchedule | null = null;
+  /** Latest prices of every fetched tariff, so switching source takes effect immediately */
+  private fetchedSchedules = new Map<TariffSourceId, PriceSchedule>();
   /** Set via the set-price API; replaces the current price until its period ends */
   private currentPriceOverride: { schedule: PriceSchedule; entry: PriceEntry } | null = null;
   private publishTimer: NodeJS.Timeout | null = null;
@@ -119,8 +123,9 @@ export class PriceServer {
 
       try {
         this.customTariff = await getCustomTariff();
+        this.priceSource = (await getPriceSourceSettings()).active;
       } catch (e) {
-        console.warn("[PriceServer] Could not load the custom tariff:", e);
+        console.warn("[PriceServer] Could not load the price source settings:", e);
       }
       await this.publishPrices();
       this.publishTimer = setInterval(() => void this.publishPrices(), PUBLISH_INTERVAL_MS);
@@ -133,7 +138,7 @@ export class PriceServer {
       console.log("[PriceServer]   - CommodityPrice (0x0095) ✓");
       console.log("[PriceServer]   - ElectricalGridConditions (0x00A0) ✓");
       console.log("[PriceServer]   - TimeSynchronization (0x0038) on endpoint 0 ✓");
-      console.log(`[PriceServer] Price source: ${this.customTariff ? `custom tariff "${this.customTariff.name}"` : "fetched prices"}`);
+      console.log(`[PriceServer] Price source: ${this.describePriceSource()}`);
     } catch (error) {
       console.error("[PriceServer] Failed to start:", error);
       throw error;
@@ -193,7 +198,7 @@ export class PriceServer {
   }
 
   /**
-   * Use a custom daily tariff in place of fetched prices; null reverts to fetched prices
+   * The custom daily tariff (published while the custom price source is selected); null when none is saved
    */
   async setCustomTariff(tariff: CustomTariff | null) {
     this.customTariff = tariff;
@@ -202,18 +207,42 @@ export class PriceServer {
   }
 
   /**
-   * Prices from a fetcher (e.g. Octopus Agile); published only while no custom tariff is set
+   * Prices from a tariff fetcher; published while that tariff is the selected price source
    */
-  async setFetchedSchedule(schedule: PriceSchedule) {
-    this.fetchedSchedule = schedule;
-    await this.refreshEstimates();
-    await this.publishPrices();
+  async setFetchedSchedule(sourceId: TariffSourceId, schedule: PriceSchedule) {
+    this.fetchedSchedules.set(sourceId, schedule);
+    if (sourceId === this.priceSource) {
+      await this.refreshEstimates();
+      await this.publishPrices();
+    }
   }
 
-  /** Recompute the estimated prices that follow the fetched schedule */
+  /** Switch the published prices to another source */
+  async setPriceSource(source: PriceSourceId) {
+    if (source === this.priceSource) return;
+    this.priceSource = source;
+    this.currentPriceOverride = null;
+    this.estimatedEntries = [];
+    await this.refreshEstimates();
+    await this.publishPrices();
+    console.log(`[PriceServer] Price source changed to ${this.describePriceSource()}`);
+  }
+
+  describePriceSource() {
+    if (this.priceSource === "custom") {
+      return this.customTariff ? `Custom tariff "${this.customTariff.name}"` : "Custom tariff (none saved)";
+    }
+    return priceSourceName(this.priceSource);
+  }
+
+  /** Recompute the estimated prices that follow the selected fetched tariff */
   private async refreshEstimates() {
+    if (this.priceSource === "custom") {
+      this.estimatedEntries = [];
+      return;
+    }
     try {
-      const estimate = await getEstimatedPrices("GBP", "uk", PRICE_ESTIMATE_HOURS);
+      const estimate = await getEstimatedPrices("GBP", "uk", PRICE_ESTIMATE_HOURS, this.priceSource);
       this.estimatedEntries = estimate.estimates;
     } catch (e) {
       console.warn("[PriceServer] Unable to estimate prices:", e);
@@ -238,7 +267,8 @@ export class PriceServer {
   getPublishedPrices() {
     const state = this.tariffEndpoint?.state?.commodityPrice;
     return {
-      source: this.currentPriceOverride ? "override" : this.customTariff ? "custom" : this.fetchedSchedule ? "fetched" : "none",
+      source: this.currentPriceOverride ? "override" : this.priceSource,
+      sourceName: this.describePriceSource(),
       customTariff: this.customTariff?.name ?? null,
       currency: state?.currency ?? null,
       currentPrice: state?.currentPrice ?? null,
@@ -271,7 +301,12 @@ export class PriceServer {
       this.currentPriceOverride = null;
     }
 
-    const schedule = this.customTariff ? expandDailyTariff(this.customTariff, now) : this.fetchedSchedule;
+    const custom = this.priceSource === "custom";
+    const schedule = custom
+      ? this.customTariff
+        ? expandDailyTariff(this.customTariff, now)
+        : null
+      : this.fetchedSchedules.get(this.priceSource as TariffSourceId) ?? null;
     const upcoming = (schedule?.entries ?? [])
       .filter(entry => entry.periodEnd > now)
       .sort((a, b) => a.periodStart - b.periodStart);
@@ -281,7 +316,7 @@ export class PriceServer {
     // Fetched prices only cover what has been published, so estimates continue the forecast beyond them.
     // A custom tariff repeats daily and needs none; an override doesn't change the forecast.
     const publishedUntil = Math.max(now, ...upcoming.map(entry => entry.periodEnd));
-    const estimated = this.customTariff
+    const estimated = custom
       ? []
       : this.estimatedEntries
           .filter(entry => entry.periodStart >= publishedUntil)

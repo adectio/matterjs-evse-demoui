@@ -480,8 +480,10 @@ function placeForecastCharts(evses, prices, carbon) {
 
 function drawForecastChart(canvas, forecast, prices, carbon) {
     const now = Date.now();
-    const xMin = Math.min(now, forecast.startTime * 1000);
-    const xMax = Math.max(forecast.endTime, forecast.latestEndTime ?? 0) * 1000;
+    // A margin either side keeps the "Now" and "Must finish by" lines inside the plot rather than on its edges
+    const MARGIN_MS = 15 * 60 * 1000;
+    const xMin = Math.min(now, forecast.startTime * 1000) - MARGIN_MS;
+    const xMax = Math.max(forecast.endTime, forecast.latestEndTime ?? 0) * 1000 + MARGIN_MS;
 
     // Each slot holds its power until the next slot starts
     const powerPoints = forecast.slots.map(slot => ({ x: slot.startTime * 1000, y: (slot.nominalPower ?? 0) / 1_000_000 }));
@@ -492,6 +494,7 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
         {
             label: "Forecast power (kW)",
             data: powerPoints,
+            pointStyle: "rect",
             // Chart.js "before": hold each value until the next point (a slot keeps its power until the next slot)
             stepped: "before",
             fill: "origin",
@@ -500,10 +503,10 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
             pointRadius: 0,
             yAxisID: "power",
         },
-        verticalLine("Now", now, maxPower, "#60708a"),
     ];
+    const markers = [{ x: now, label: "Now", color: "#60708a" }];
     if (forecast.latestEndTime !== null) {
-        datasets.push(verticalLine("Must finish by", forecast.latestEndTime * 1000, maxPower, "#c83f54"));
+        markers.push({ x: forecast.latestEndTime * 1000, label: "Must finish by", color: "#c83f54" });
     }
 
     const decimals = prices?.metadata?.decimals ?? 2;
@@ -525,9 +528,10 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
     const tariffUnit = prices?.metadata?.currency === "GBP" || prices?.metadata?.currency === undefined ? "p" : prices.metadata.currency;
     if (pricePoints.length > 0) {
         datasets.push({
-            label: `Tariff (${tariffUnit}/kWh)`,
+            label: `${prices.priceSource?.name ?? "Tariff"} (${tariffUnit}/kWh)`,
             data: pricePoints,
             stepped: "before",
+            pointStyle: "line",
             borderColor: "#f57c00",
             borderWidth: 1.5,
             pointRadius: 0,
@@ -540,6 +544,7 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
             label: `Estimated tariff (${tariffUnit}/kWh)`,
             data: estimatedPoints,
             stepped: "before",
+            pointStyle: "line",
             borderColor: "#f57c00",
             borderDash: [6, 4],
             borderWidth: 1.5,
@@ -561,6 +566,7 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
             label: "Grid carbon (gCO₂/kWh)",
             data: carbonPoints,
             stepped: "before",
+            pointStyle: "line",
             borderColor: "#2e7d32",
             borderWidth: 1.5,
             pointRadius: 0,
@@ -568,17 +574,24 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
         });
     }
 
+    alignStepSeries(datasets, xMin, xMax);
+
     return new Chart(canvas, {
             type: "line",
             data: { datasets },
+            plugins: [markerLinesPlugin],
             options: {
                 animation: false,
                 maintainAspectRatio: false,
                 parsing: false,
                 interaction: { mode: "nearest", axis: "x", intersect: false },
                 plugins: {
-                    legend: { position: "top" },
-                    tooltip: { callbacks: { title: items => (items.length ? clockTime(items[0].parsed.x / 1000) : "") } },
+                    legend: { position: "top", labels: { usePointStyle: true } },
+                    markerLines: { markers },
+                    tooltip: {
+                        // Every series has a point at the same times (see alignStepSeries), so all appear together
+                        callbacks: { title: items => (items.length ? clockTime(items[0].parsed.x / 1000) : "") },
+                    },
                 },
                 scales: {
                     x: {
@@ -612,19 +625,61 @@ function drawForecastChart(canvas, forecast, prices, carbon) {
         });
 }
 
-function verticalLine(label, x, height, color) {
-    return {
-        label,
-        data: [
-            { x, y: 0 },
-            { x, y: height },
-        ],
-        borderColor: color,
-        borderDash: [4, 4],
-        borderWidth: 1,
-        pointRadius: 0,
-        yAxisID: "power",
-    };
+/** Labelled vertical lines (e.g. "Now") drawn over the chart; they aren't data, so stay out of the legend and tooltip */
+const markerLinesPlugin = {
+    id: "markerLines",
+    afterDatasetsDraw(chart, _args, options) {
+        const { ctx, chartArea, scales } = chart;
+        for (const marker of options.markers ?? []) {
+            const x = scales.x.getPixelForValue(marker.x);
+            if (x < chartArea.left || x > chartArea.right) continue;
+            ctx.save();
+            ctx.strokeStyle = marker.color;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(x, chartArea.top);
+            ctx.lineTo(x, chartArea.bottom);
+            ctx.stroke();
+            // Label beside the line, flipped to the left near the right-hand edge
+            const nearRight = x > chartArea.right - 100;
+            ctx.setLineDash([]);
+            ctx.fillStyle = marker.color;
+            ctx.font = "12px sans-serif";
+            ctx.textAlign = nearRight ? "right" : "left";
+            ctx.fillText(marker.label, x + (nearRight ? -4 : 4), chartArea.top + 12);
+            ctx.restore();
+        }
+    },
+};
+
+const HALF_HOUR_MS = 30 * 60 * 1000;
+
+/**
+ * Resample step series (each holding its value until its next point) onto one shared set of times: every half
+ * hour plus every point where any series changes. The lines draw the same, but the tooltip's nearest-point lookup
+ * then finds every series at the same time, rather than only the one that changes most often (e.g. carbon versus
+ * a custom tariff with a few long periods).
+ */
+function alignStepSeries(datasets, xMin, xMax) {
+    const times = new Set();
+    for (let x = Math.floor(xMin / HALF_HOUR_MS) * HALF_HOUR_MS; x <= xMax; x += HALF_HOUR_MS) times.add(x);
+    for (const dataset of datasets) for (const point of dataset.data) times.add(point.x);
+    const grid = [...times].sort((a, b) => a - b);
+
+    for (const dataset of datasets) {
+        const points = dataset.data;
+        if (points.length === 0) continue;
+        const first = points[0].x;
+        const last = points[points.length - 1].x;
+        let index = 0;
+        dataset.data = grid
+            .filter(x => x >= first && x <= last)
+            .map(x => {
+                while (index + 1 < points.length && points[index + 1].x <= x) index++;
+                return { x, y: points[index].y };
+            });
+    }
 }
 
 function clockTime(seconds) {

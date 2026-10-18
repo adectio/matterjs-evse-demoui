@@ -8,6 +8,13 @@
 import { ServerResponse } from "node:http";
 import { clearCustomTariff, CURRENCY_CODES, CustomTariff, getCustomTariff, saveCustomTariff } from "../database/custom-tariff.js";
 import type { PriceServer } from "./index.js";
+import { getPriceSourceSettings, PriceSourceId, savePriceSourceSettings } from "../database/settings.js";
+
+/** Saving (or using) a custom tariff selects it as the published price source */
+async function selectPriceSource(priceServer: PriceServer, active: PriceSourceId) {
+  const settings = await savePriceSourceSettings({ active });
+  await priceServer.setPriceSource(settings.active);
+}
 
 type APIResult = { handled: boolean; statusCode?: number; response?: any };
 
@@ -45,6 +52,7 @@ async function handle(priceServer: PriceServer, pathname: string, method: string
   if (method === "POST" && pathname === "/api/price-server/set-forecast") {
     const tariff = await saveCustomTariff(tariffFromForecast(body));
     await priceServer.setCustomTariff(tariff);
+    await selectPriceSource(priceServer, "custom");
     return ok({ success: true, tariff });
   }
 
@@ -53,11 +61,17 @@ async function handle(priceServer: PriceServer, pathname: string, method: string
     if (method === "POST") {
       const tariff = await saveCustomTariff(body);
       await priceServer.setCustomTariff(tariff);
+      await selectPriceSource(priceServer, "custom");
       return ok({ success: true, tariff });
     }
     if (method === "DELETE") {
       await clearCustomTariff();
       await priceServer.setCustomTariff(null);
+      // Nothing left to publish from the custom source, so return to the fetched tariff used before it
+      const settings = await getPriceSourceSettings();
+      if (settings.active === "custom") {
+        await selectPriceSource(priceServer, settings.previousTariff ?? "octopus");
+      }
       return ok({ success: true });
     }
   }

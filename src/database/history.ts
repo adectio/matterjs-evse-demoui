@@ -83,12 +83,12 @@ export async function carbonHistoryDays(sourceId: string, region: string): Promi
   return row?.oldest ? (Date.now() / 1000 - row.oldest) / DAY_SECONDS : 0;
 }
 
-export async function getPriceHistory(currency: string): Promise<PriceHistoryRow[]> {
+export async function getPriceHistory(currency: string, sourceId?: string): Promise<PriceHistoryRow[]> {
   const db = await getDatabase();
   const rows = (await db.all(
     `SELECT period_start, period_end, price FROM commodity_price_history
-     WHERE currency = ? ORDER BY period_start ASC`,
-    [currency]
+     WHERE currency = ? AND (? IS NULL OR source_id = ?) ORDER BY period_start ASC`,
+    [currency, sourceId ?? null, sourceId ?? null]
   )) as Array<{ period_start: number; period_end: number; price: number }>;
   return rows.map((row) => ({ periodStart: row.period_start, periodEnd: row.period_end, price: row.price }));
 }

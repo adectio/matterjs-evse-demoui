@@ -69,6 +69,8 @@ async function loadPriceData() {
 
     // Update metadata
     const metadata = data.metadata || {};
+    const source = data.priceSource;
+    document.getElementById('price-source').textContent = source ? [source.name, source.detail].filter(Boolean).join(' – ') : '—';
     document.getElementById('price-currency').textContent = metadata.currency || 'GBP';
     document.getElementById('price-unit').textContent = metadata.tariff_unit || 'kWh';
     document.getElementById('price-period').textContent = `${metadata.period_minutes || 30} minutes`;
@@ -162,6 +164,22 @@ function renderEstimateNote(estimated, model) {
   note.textContent = `Dashed line: estimated prices after ${formatTime(model.publishedUntil)}, from the typical price at each time of day, ${carbon}. They are replaced when the tariff is published.`;
 }
 
+const HALF_HOUR_SECONDS = 1800;
+
+/** Split periods longer than half an hour at half-hour boundaries */
+function splitIntoHalfHours(periods) {
+  return periods.flatMap((period) => {
+    const end = period.periodEnd ?? period.periodStart + HALF_HOUR_SECONDS;
+    const slots = [];
+    for (let start = period.periodStart; start < end; ) {
+      const next = Math.min(end, (Math.floor(start / HALF_HOUR_SECONDS) + 1) * HALF_HOUR_SECONDS);
+      slots.push({ ...period, periodStart: start, periodEnd: next });
+      start = next;
+    }
+    return slots;
+  });
+}
+
 function renderPriceChart(forecast, metadata, estimated = []) {
   const chartCanvas = document.getElementById('priceChart');
   if (!chartCanvas) {
@@ -179,6 +197,11 @@ function renderPriceChart(forecast, metadata, estimated = []) {
     console.warn('No price forecast data to display');
     return;
   }
+
+  // One bar per half hour whatever the source: a custom tariff's long periods are split so the time axis is even
+  // (dropping half hours already over, which a long period in progress would otherwise add)
+  const nowSeconds = Date.now() / 1000;
+  forecast = splitIntoHalfHours(forecast).filter((period) => period.periodEnd > nowSeconds);
 
   // Published prices are bars; estimates continue after them as a dashed line
   const lastPublished = Math.max(0, ...forecast.map(p => p.periodStart));

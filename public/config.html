@@ -199,9 +199,26 @@
       border-left: 4px solid #1976d2;
     }
 
+    .tariff-timeline { border-radius: 4px; display: flex; height: 1.6rem; margin: 0.5rem 0 0.2rem; overflow: hidden; }
+    .tariff-timeline:empty { background: #eee; }
+    .tariff-timeline span { color: #fff; font-size: 0.7rem; line-height: 1.6rem; overflow: hidden; text-align: center; white-space: nowrap; }
+    .tariff-timeline-axis { color: #888; display: flex; font-size: 0.7rem; justify-content: space-between; margin-bottom: 0.75rem; }
+    .period-until { color: #555; font-size: 0.85rem; white-space: nowrap; }
+    .price-source-options { display: grid; gap: 0.75rem; margin: 1rem 0; }
+    .price-source-option { border: 1px solid #ddd; border-radius: 6px; padding: 0.9rem 1rem; }
+    .price-source-option.selected { border-color: #1976d2; background: #f3f8fe; }
+    .price-source-option.unavailable { opacity: 0.7; }
+    .price-source-choice { align-items: center; display: flex; gap: 0.6rem; margin: 0; }
+    .price-source-choice input { margin: 0; width: auto; }
+    .price-source-name { font-weight: 600; }
+    .price-source-badge { background: #1976d2; border-radius: 999px; color: #fff; font-size: 0.75rem; padding: 0.1rem 0.55rem; }
+    .price-source-status { color: #666; font-size: 0.85rem; margin: 0.35rem 0 0 1.6rem; }
+    .price-source-option .form-row { margin: 0.75rem 0 0 1.6rem; }
+    .price-source-option .form-group { margin-bottom: 0; }
+
     .tariff-period {
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr 2fr auto;
+      grid-template-columns: 1fr minmax(7rem, auto) 1fr 1fr 2fr auto;
       gap: 0.5rem;
       align-items: end;
       margin-bottom: 0.5rem;
@@ -264,60 +281,13 @@
     <div class="config-container">
       <div id="status-message"></div>
 
-      <!-- Commodity Price Sources -->
+      <!-- Price Source -->
       <div class="config-section">
-        <h2>Commodity Price Sources</h2>
-
-        <!-- Kraken -->
-        <div class="form-group">
-          <div class="toggle-group">
-            <input type="checkbox" id="kraken-enabled" checked />
-            <label for="kraken-enabled" style="margin: 0;">EDF Kraken (UK)</label>
-          </div>
-          <label for="kraken-api-key">API Key:</label>
-          <input type="password" id="kraken-api-key" placeholder="Enter your Kraken API key" />
-          <p class="help-text">Get your API key from <a href="https://kraken.energy" target="_blank">kraken.energy</a></p>
-        </div>
-
-        <!-- Octopus Agile -->
-        <div class="form-group">
-          <div class="toggle-group">
-            <input type="checkbox" id="octopus-enabled" checked />
-            <label for="octopus-enabled" style="margin: 0;">Octopus Agile (UK)</label>
-          </div>
-          <label for="octopus-api-key">API Key:</label>
-          <input type="password" id="octopus-api-key" placeholder="Enter your Octopus API key" />
-          <p class="help-text">Get your API key from <a href="https://octopus.energy" target="_blank">octopus.energy</a></p>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label for="octopus-product">Product Code:</label>
-              <input type="text" id="octopus-product" value="AGILE-22-11-01" />
-            </div>
-            <div class="form-group">
-              <label for="octopus-region">Region Code:</label>
-              <select id="octopus-region">
-                <option value="A">A - Eastern England</option>
-                <option value="B">B - East Midlands</option>
-                <option value="C">C - London</option>
-                <option value="D">D - Merseyside and Northern Wales</option>
-                <option value="E">E - West Midlands</option>
-                <option value="F">F - North Eastern England</option>
-                <option value="G">G - North Western England</option>
-                <option value="H">H - Northern Scotland</option>
-                <option value="J">J - South Eastern England</option>
-                <option value="K">K - South Eastern England (secondary)</option>
-                <option value="L">L - South Wales</option>
-                <option value="M">M - South Western England</option>
-                <option value="N">N - Southern Scotland</option>
-                <option value="P">P - West Wales</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
+        <h2>Price Source</h2>
+        <p class="help-text">Every dynamic tariff below is fetched hourly so its price history (and the price estimates) stay current. Choose which one the price server publishes to Matter devices; the charts follow the same choice.</p>
+        <div id="price-source-options" class="price-source-options">Loading price sources…</div>
         <div class="button-group">
-          <button class="btn-primary" onclick="savePriceSources()">Save Price Sources</button>
+          <button class="btn-primary" onclick="savePriceSource()">Save Price Source</button>
         </div>
       </div>
 
@@ -361,6 +331,7 @@
       <!-- Custom Tariff -->
       <div class="config-section">
         <h2>Custom Time-of-Use Tariff</h2>
+        <p class="help-text">Saving a custom tariff selects it as the price source. Clearing it returns to the dynamic tariff used before.</p>
 
         <div class="form-group">
           <label for="tariff-name">Tariff Name:</label>
@@ -379,6 +350,8 @@
 
         <div class="form-group">
           <label>Price Periods (price per kWh in pence or cents; each period runs until the next one starts, repeating daily):</label>
+          <div id="tariff-timeline" class="tariff-timeline" aria-label="Tariff over 24 hours"></div>
+          <div class="tariff-timeline-axis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
           <div id="tariff-periods"></div>
           <button class="btn-secondary" onclick="addTariffPeriod()">Add Period</button>
         </div>

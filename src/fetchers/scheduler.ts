@@ -1,7 +1,7 @@
 import { getDatabase } from '../database/schema.js';
 import { deleteExpiredForecasts } from '../database/queries.js';
-import { fetchKrakenPrices } from './kraken.js';
-import { fetchOctopusAgileRates } from './octopus.js';
+import { fetchKrakenTariffRates } from './kraken-tariff.js';
+import { TARIFF_SOURCE_IDS } from './tariff-sources.js';
 import { fetchUKCarbonIntensity } from './carbon-intensity.js';
 
 interface FetcherConfig {
@@ -19,43 +19,20 @@ export async function initializeScheduler(): Promise<void> {
 
   // Load configuration from environment or database
   const fetcherConfigs: FetcherConfig[] = [
-    {
-      name: 'kraken',
-      intervalMinutes: 30,
-      enabled: !!process.env.KRAKEN_API_KEY,
-      config: {
-        apiKey: process.env.KRAKEN_API_KEY || '',
-      },
-      handler: async () => {
-        try {
-          if (process.env.KRAKEN_API_KEY) {
-            await fetchKrakenPrices(process.env.KRAKEN_API_KEY);
-          }
-        } catch (error) {
-          console.error('Kraken fetch error:', error);
-        }
-      },
-    },
-    {
-      name: 'octopus',
+    // Every dynamic tariff is fetched (keeping its history current); the settings choose which is published
+    ...TARIFF_SOURCE_IDS.map((sourceId) => ({
+      name: sourceId,
       intervalMinutes: 60,
-      enabled: true, // Octopus public API doesn't require a key
-      config: {
-        productCode: process.env.OCTOPUS_PRODUCT_CODE || 'AGILE-24-10-01',
-        regionCode: process.env.OCTOPUS_REGION || 'E',
-      },
+      enabled: true, // Kraken-platform tariff rates are public and don't need an API key
+      config: {},
       handler: async () => {
         try {
-          await fetchOctopusAgileRates(
-            '', // API key not needed for public endpoint
-            process.env.OCTOPUS_PRODUCT_CODE || 'AGILE-24-10-01',
-            process.env.OCTOPUS_REGION || 'E'
-          );
+          await fetchKrakenTariffRates(sourceId);
         } catch (error) {
-          console.error('Octopus fetch error:', error);
+          console.error(`${sourceId} tariff fetch error:`, error);
         }
       },
-    },
+    })),
     {
       name: 'uk-carbon-intensity',
       intervalMinutes: 30,

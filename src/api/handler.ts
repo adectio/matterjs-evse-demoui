@@ -1,4 +1,14 @@
 import { getEstimatedPrices } from "../price-server/price-estimates.js";
+import {
+  getActiveCurrentPrice,
+  getActivePriceForecast,
+  getActivePriceMetadata,
+  PriceSourceView,
+  resolvePriceSource,
+} from "../price-server/active-prices.js";
+import { getPriceSourceSettings, savePriceSourceSettings } from "../database/settings.js";
+import { getCustomTariff } from "../database/custom-tariff.js";
+import { TARIFF_SOURCES, TARIFF_SOURCE_IDS } from "../fetchers/tariff-sources.js";
 import { ServerResponse, IncomingMessage } from "node:http";
 import {
   getPriceForecast,
@@ -19,16 +29,19 @@ export async function handleApiRequest(
   response: ServerResponse
 ): Promise<boolean> {
   // Commodity Price endpoints
+  // Prices come from the selected price source unless ?source= names another
   if (method === "GET" && pathname === "/api/commodity-price/current") {
     const currency = url.searchParams.get("currency") || "GBP";
-    const price = await getCurrentPrice(currency);
-    const meta = await getLatestPriceForecastMetadata(currency);
-    const status = await getCacheStatus(`kraken-prices`);
+    const source = await resolvePriceSource(url.searchParams.get("source"));
+    const price = await getActiveCurrentPrice(source, currency);
+    const meta = await getActivePriceMetadata(source, currency);
+    const status = await priceCacheStatus(source);
 
     sendJson(response, 200, {
       timestamp: new Date().toISOString(),
       current: price,
       metadata: meta,
+      priceSource: source,
       cacheStatus: status,
     });
     return true;
@@ -39,21 +52,22 @@ export async function handleApiRequest(
     const hours = parseInt(url.searchParams.get("hours") || "24");
     const from = parseFromParam(url);
 
-    const forecast = await getPriceForecast(currency, hours, from);
-    const meta = await getLatestPriceForecastMetadata(currency);
-    const status = await getCacheStatus(`kraken-prices`);
+    const source = await resolvePriceSource(url.searchParams.get("source"));
+    const forecast = await getActivePriceForecast(source, currency, hours, from);
+    const meta = await getActivePriceMetadata(source, currency);
+    const status = await priceCacheStatus(source);
 
-    console.log(`Price forecast query: currency=${currency}, hours=${hours}, results=${forecast.length}, metadata=`, meta);
-
-    // Estimated prices beyond the published tariff (from price history and the carbon forecast)
+    // Estimated prices beyond a fetched tariff's published rates (a custom tariff repeats daily, so needs none)
     let estimated: Array<{ periodStart: number; periodEnd: number; price: number }> = [];
     let estimateModel = null;
-    try {
-      const estimate = await getEstimatedPrices(currency, "uk", hours);
-      estimated = estimate.estimates;
-      estimateModel = { ...estimate.model, publishedUntil: estimate.publishedUntil };
-    } catch (error) {
-      console.warn("Price estimate failed:", error);
+    if (source.id !== "custom") {
+      try {
+        const estimate = await getEstimatedPrices(currency, "uk", hours, source.id);
+        estimated = estimate.estimates;
+        estimateModel = { ...estimate.model, publishedUntil: estimate.publishedUntil };
+      } catch (error) {
+        console.warn("Price estimate failed:", error);
+      }
     }
 
     sendJson(response, 200, {
@@ -62,6 +76,7 @@ export async function handleApiRequest(
       estimated,
       estimateModel,
       metadata: meta,
+      priceSource: source,
       cacheStatus: status,
       periodCount: forecast.length,
     });
@@ -106,6 +121,34 @@ export async function handleApiRequest(
   }
 
   // Configuration endpoints
+  // Price source selection: which tariff the price server publishes (all fetched tariffs keep updating)
+  if (pathname === "/api/config/price-source") {
+    if (method === "GET") {
+      sendJson(response, 200, await describePriceSources());
+      return true;
+    }
+    if (method === "POST") {
+      const body = await readJsonBody(response.req);
+      if (body.active === "custom" && !(await getCustomTariff())) {
+        sendJson(response, 400, { error: "Save a custom tariff before selecting it." });
+        return true;
+      }
+      const previous = await getPriceSourceSettings();
+      const settings = await savePriceSourceSettings(body);
+      await (globalThis as any).__priceServer?.setPriceSource(settings.active);
+      // Fetch any tariff whose product or region changed (in the background)
+      for (const id of TARIFF_SOURCE_IDS) {
+        const before = previous.tariffs[id];
+        const after = settings.tariffs[id];
+        if (before.productCode !== after.productCode || before.regionCode !== after.regionCode) {
+          triggerFetch(id).catch((error) => console.warn(`Refetch of ${id} failed:`, error));
+        }
+      }
+      sendJson(response, 200, { status: "Price source saved.", ...(await describePriceSources()) });
+      return true;
+    }
+  }
+
   if (method === "GET" && pathname === "/api/config/status") {
     const fetcherStatus = await getFetcherStatus();
     const cacheStats = await getCacheStats();
@@ -214,4 +257,52 @@ function parseFromParam(url: URL): number | undefined {
   if (!Number.isFinite(value) || value <= 0) return undefined;
   const now = Math.floor(Date.now() / 1000);
   return Math.max(value, now - 24 * 3600);
+}
+
+async function priceCacheStatus(source: PriceSourceView) {
+  if (source.id === "custom") return "fresh";
+  const settings = await getPriceSourceSettings();
+  return getCacheStatus(`${source.id}-rates-${settings.tariffs[source.id].regionCode}`);
+}
+
+/** Settings plus what each source currently holds, for the configuration page */
+async function describePriceSources() {
+  const settings = await getPriceSourceSettings();
+  const db = await getDatabase();
+  const tariffs = [];
+  for (const id of TARIFF_SOURCE_IDS) {
+    const latest = await db.get(
+      `SELECT cpf.fetched_at, COUNT(cp.id) AS rates, MAX(cp.period_end) AS published_until
+       FROM commodity_price_forecasts cpf LEFT JOIN commodity_prices cp ON cp.forecast_id = cpf.id
+       WHERE cpf.source_id = ? GROUP BY cpf.id ORDER BY cpf.fetched_at DESC LIMIT 1`,
+      [id]
+    );
+    const current = await getActiveCurrentPrice(await resolvePriceSource(id), "GBP");
+    tariffs.push({
+      id,
+      name: TARIFF_SOURCES[id].name,
+      ...settings.tariffs[id],
+      fetchedAt: latest?.fetched_at ?? null,
+      rateCount: latest?.rates ?? 0,
+      publishedUntil: latest?.published_until ?? null,
+      currentPrice: current?.price ?? null,
+    });
+  }
+  const customTariff = await getCustomTariff();
+  return {
+    active: settings.active,
+    activeSource: await resolvePriceSource(settings.active),
+    tariffs,
+    customTariff: customTariff ? { name: customTariff.name, periods: customTariff.periods.length } : null,
+  };
+}
+
+async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    throw new Error("Request body must be valid JSON.");
+  }
 }

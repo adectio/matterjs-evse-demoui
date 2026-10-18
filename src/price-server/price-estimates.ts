@@ -20,14 +20,14 @@ function mergeByPeriod<T extends { periodStart: number }>(...series: T[][]): T[]
 }
 
 /** Prices in the current forecast tables (covers the time before the history has been populated) */
-async function getForecastPrices(currency: string): Promise<PricePeriod[]> {
+async function getForecastPrices(currency: string, sourceId: string): Promise<PricePeriod[]> {
     const db = await getDatabase();
     const rows = (await db.all(
         `SELECT cp.period_start, cp.period_end, cp.price
          FROM commodity_prices cp
          JOIN commodity_price_forecasts cpf ON cp.forecast_id = cpf.id
-         WHERE cpf.currency = ? AND cp.price IS NOT NULL`,
-        [currency],
+         WHERE cpf.currency = ? AND cpf.source_id = ? AND cp.price IS NOT NULL`,
+        [currency, sourceId],
     )) as Array<{ period_start: number; period_end: number | null; price: number }>;
     return rows.map(row => ({
         periodStart: row.period_start,
@@ -47,13 +47,18 @@ async function getForecastCarbon(region: string): Promise<CarbonPeriod[]> {
 }
 
 /**
- * Estimate prices from the end of the published tariff until `hours` from now, learning from up to a
- * month of stored price and carbon history.
+ * Estimate prices of a fetched tariff from the end of its published rates until `hours` from now, learning
+ * from up to a month of its stored price history and the carbon history.
  */
-export async function getEstimatedPrices(currency: string, region: string, hours: number): Promise<PriceEstimateResult> {
+export async function getEstimatedPrices(
+    currency: string,
+    region: string,
+    hours: number,
+    sourceId: string,
+): Promise<PriceEstimateResult> {
     const now = Math.floor(Date.now() / 1000);
 
-    const known = mergeByPeriod(await getForecastPrices(currency), await getPriceHistory(currency));
+    const known = mergeByPeriod(await getForecastPrices(currency, sourceId), await getPriceHistory(currency, sourceId));
     const carbon = mergeByPeriod<CarbonPeriod>(await getCarbonHistory(region), await getForecastCarbon(region));
 
     const publishedUntil = known.length > 0 ? Math.max(...known.map(period => period.periodEnd)) : null;
