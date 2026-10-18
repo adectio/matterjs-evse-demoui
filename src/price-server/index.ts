@@ -10,8 +10,10 @@
 import { ServerNode } from "@matter/node";
 import { ElectricalEnergyTariffDevice } from "@matter/node/devices";
 import { CommodityPriceServer, ElectricalGridConditionsServer } from "@matter/node/behaviors";
+import { getCustomTariff, CustomTariff } from "../database/custom-tariff.js";
 import { registerPriceServerAPI } from "./api.js";
 import { TimeSourceServer } from "./behaviors/time-source.js";
+import { expandDailyTariff, MAX_FORECAST_ENTRIES, PriceEntry, PriceSchedule } from "./schedule.js";
 
 export { registerPriceServerAPI };
 export const PRICE_SERVER_NODE_ID = 0x2000;
@@ -20,23 +22,8 @@ export const PRICE_SERVER_PASSCODE = 24681357;
 export const PRICE_SERVER_DISCRIMINATOR = 0xa00;
 export const PRICE_SERVER_PRODUCT_NAME = "Adectio Energy Tariff Server";
 
-
-/**
- * Map price level strings to numeric values (int16)
- */
-function mapPriceLevel(level: string | number): number {
-  if (typeof level === 'number') return level;
-
-  const levelMap: Record<string, number> = {
-    'very-low': 0,
-    'low': 1,
-    'medium': 2,
-    'high': 3,
-    'very-high': 4,
-  };
-
-  return levelMap[level] ?? 2; // Default to medium
-}
+/** How often CurrentPrice/PriceForecast are re-evaluated so CurrentPrice advances at period boundaries */
+const PUBLISH_INTERVAL_MS = 30_000;
 
 /**
  * Map carbon intensity (gCO2/kWh) to ThreeLevelEnum: 0=Low (<100), 1=Medium, 2=High (>250)
@@ -53,9 +40,14 @@ function carbonLevelFor(carbonIntensity: number): number {
 export class PriceServer {
   private serverNode: ServerNode | null = null;
   private tariffEndpoint: any = null;
-  private commodityPriceServer: CommodityPriceServer | null = null;
-  private egcServer: ElectricalGridConditionsServer | null = null;
   private started = false;
+  /** A saved custom tariff takes precedence over fetched (Octopus) prices */
+  private customTariff: CustomTariff | null = null;
+  private fetchedSchedule: PriceSchedule | null = null;
+  /** Set via the set-price API; replaces the current price until its period ends */
+  private currentPriceOverride: { schedule: PriceSchedule; entry: PriceEntry } | null = null;
+  private publishTimer: NodeJS.Timeout | null = null;
+  private publishing = Promise.resolve();
 
   constructor() {}
 
@@ -110,28 +102,18 @@ export class PriceServer {
         },
       });
 
-      // Get references to cluster servers via .agent property
-      try {
-        console.log("[PriceServer] Endpoint agent keys:", Object.keys(this.tariffEndpoint.agent || {}));
-        console.log("[PriceServer] Full agent:", this.tariffEndpoint.agent);
-
-        // Try different ways to access the clusters
-        this.commodityPriceServer = this.tariffEndpoint.agent?.commodityPrice ||
-                                    this.tariffEndpoint.state?.commodityPrice;
-        this.egcServer = this.tariffEndpoint.agent?.electricalGridConditions ||
-                         this.tariffEndpoint.state?.electricalGridConditions;
-
-        console.log("[PriceServer] Endpoint created with clusters");
-        console.log("[PriceServer] CommodityPrice available:", !!this.commodityPriceServer);
-        console.log("[PriceServer] ElectricalGridConditions available:", !!this.egcServer);
-      } catch (e) {
-        console.warn("[PriceServer] Error accessing cluster servers:", e);
-      }
-
       console.log("[PriceServer] Starting server...");
       await this.serverNode.start();
 
       this.started = true;
+
+      try {
+        this.customTariff = await getCustomTariff();
+      } catch (e) {
+        console.warn("[PriceServer] Could not load the custom tariff:", e);
+      }
+      await this.publishPrices();
+      this.publishTimer = setInterval(() => void this.publishPrices(), PUBLISH_INTERVAL_MS);
 
       console.log("[PriceServer] ✅ Started successfully");
       console.log(`[PriceServer] Passcode: ${PRICE_SERVER_PASSCODE}`);
@@ -141,7 +123,7 @@ export class PriceServer {
       console.log("[PriceServer]   - CommodityPrice (0x0091) ✓");
       console.log("[PriceServer]   - ElectricalGridConditions (0x00A0) ✓");
       console.log("[PriceServer]   - TimeSynchronization (0x0038) on endpoint 0 ✓");
-      console.log("[PriceServer] Update prices via: POST /api/price-server/set-price");
+      console.log(`[PriceServer] Price source: ${this.customTariff ? `custom tariff "${this.customTariff.name}"` : "fetched prices"}`);
     } catch (error) {
       console.error("[PriceServer] Failed to start:", error);
       throw error;
@@ -152,6 +134,8 @@ export class PriceServer {
    * Stop the server
    */
   async stop(): Promise<void> {
+    if (this.publishTimer) clearInterval(this.publishTimer);
+    this.publishTimer = null;
     if (this.serverNode) {
       await this.serverNode.close();
     }
@@ -163,13 +147,7 @@ export class PriceServer {
    * Get HTTP API handler
    */
   getAPIHandler() {
-    return registerPriceServerAPI(
-      {
-        commodityPrice: this.commodityPriceServer as any,
-        gridConditions: this.egcServer as any,
-      },
-      async () => ({ handled: false })
-    );
+    return registerPriceServerAPI(this);
   }
 
   /**
@@ -194,48 +172,98 @@ export class PriceServer {
   }
 
   /**
-   * Update CurrentPrice attribute from fetcher data
-   * @param price Price in smallest unit (e.g. pence for GBP)
-   * @param priceLevel numeric level (int16)
-   * @param currency Currency code (ISO 4217) - default 826 (GBP)
-   * @param decimalPoints Number of decimal points - default 2 (pence)
+   * Use a custom daily tariff in place of fetched prices; null reverts to fetched prices
    */
-  async setCurrentPrice(
-    price: number,
-    priceLevel: string | number,
-    periodStart: number,
-    periodEnd: number,
-    currency: number = 826,
-    decimalPoints: number = 2
-  ) {
-    const mappedLevel = mapPriceLevel(priceLevel);
-    console.log("[PriceServer.setCurrentPrice] Called with:", { price, priceLevel, mappedLevel, periodStart, periodEnd });
-    if (!this.tariffEndpoint) {
-      console.warn("[PriceServer] Endpoint not available");
+  async setCustomTariff(tariff: CustomTariff | null) {
+    this.customTariff = tariff;
+    this.currentPriceOverride = null;
+    await this.publishPrices();
+  }
+
+  /**
+   * Prices from a fetcher (e.g. Octopus Agile); published only while no custom tariff is set
+   */
+  async setFetchedSchedule(schedule: PriceSchedule) {
+    this.fetchedSchedule = schedule;
+    await this.publishPrices();
+  }
+
+  /**
+   * Replace CurrentPrice until the end of the current half hour, after which the active schedule resumes
+   */
+  async overrideCurrentPrice(price: number, priceLevel: number, currency: number, decimalPoints: number) {
+    const now = Math.floor(Date.now() / 1000);
+    const periodStart = now - (now % 1800);
+    const entry = { periodStart, periodEnd: periodStart + 1800, price, priceLevel };
+    this.currentPriceOverride = { schedule: { currency, decimalPoints, entries: [entry] }, entry };
+    await this.publishPrices();
+    return entry;
+  }
+
+  /**
+   * What is being published, read back from the CommodityPrice cluster
+   */
+  getPublishedPrices() {
+    const state = this.tariffEndpoint?.state?.commodityPrice;
+    return {
+      source: this.currentPriceOverride ? "override" : this.customTariff ? "custom" : this.fetchedSchedule ? "fetched" : "none",
+      customTariff: this.customTariff?.name ?? null,
+      currency: state?.currency ?? null,
+      currentPrice: state?.currentPrice ?? null,
+      priceForecast: state?.priceForecast ?? [],
+    };
+  }
+
+  /**
+   * What the ElectricalGridConditions cluster is currently publishing
+   */
+  getPublishedGridConditions() {
+    return this.tariffEndpoint?.state?.electricalGridConditions?.currentConditions ?? null;
+  }
+
+  /**
+   * Write CurrentPrice and PriceForecast from the active schedule; serialised so overlapping calls don't interleave
+   */
+  private publishPrices() {
+    this.publishing = this.publishing.then(() => this.writePrices()).catch(e => {
+      console.warn("[PriceServer] Error publishing prices:", e);
+    });
+    return this.publishing;
+  }
+
+  private async writePrices() {
+    if (!this.tariffEndpoint) return;
+    const now = Math.floor(Date.now() / 1000);
+    if (this.currentPriceOverride && this.currentPriceOverride.entry.periodEnd <= now) {
+      this.currentPriceOverride = null;
+    }
+
+    const schedule = this.customTariff ? expandDailyTariff(this.customTariff, now) : this.fetchedSchedule;
+    const upcoming = (schedule?.entries ?? [])
+      .filter(entry => entry.periodEnd > now)
+      .sort((a, b) => a.periodStart - b.periodStart);
+    const current = this.currentPriceOverride?.entry ?? upcoming.find(entry => entry.periodStart <= now) ?? null;
+    const { currency, decimalPoints } = this.currentPriceOverride?.schedule ?? schedule ?? { currency: 826, decimalPoints: 4 };
+
+    const next = {
+      currency: { currency, decimalPoints },
+      currentPrice: current,
+      priceForecast: upcoming.slice(0, MAX_FORECAST_ENTRIES),
+    };
+    const state = this.tariffEndpoint.state.commodityPrice;
+    if (JSON.stringify(next) === JSON.stringify({ currency: state.currency, currentPrice: state.currentPrice, priceForecast: state.priceForecast })) {
       return;
     }
 
-    try {
-      // Wrap mutation inside execution context
-      await this.tariffEndpoint.act(async (agent: any) => {
-        // Set Currency struct with correct field names
-        agent.commodityPrice.state.currency = {
-          currency: currency,
-          decimalPoints: decimalPoints,
-        };
-
-        // Use Unix timestamps directly (Matter epoch-s type accepts Unix seconds >= 2000-01-01)
-        agent.commodityPrice.state.currentPrice = {
-          periodStart,
-          periodEnd,
-          price,
-          priceLevel: mappedLevel,
-        };
-      });
-      console.log(`[PriceServer] Updated CurrentPrice: ${price}p`);
-    } catch (e) {
-      console.warn("[PriceServer] Error updating CurrentPrice:", e);
-    }
+    await this.tariffEndpoint.act(async (agent: any) => {
+      agent.commodityPrice.state.currency = next.currency;
+      agent.commodityPrice.state.currentPrice = next.currentPrice;
+      agent.commodityPrice.state.priceForecast = next.priceForecast;
+    });
+    console.log(
+      `[PriceServer] Published CurrentPrice=${current?.price ?? "null"} (decimalPoints=${decimalPoints}), ` +
+        `${next.priceForecast.length} forecast entries`,
+    );
   }
 
   /**
@@ -264,32 +292,6 @@ export class PriceServer {
       console.log(`[PriceServer] Updated GridConditions: carbonIntensity=${carbonIntensity}`);
     } catch (e) {
       console.warn("[PriceServer] Error updating GridConditions:", e);
-    }
-  }
-
-  /**
-   * Set price forecast (for FORECAST feature)
-   */
-  async setPriceForecast(
-    forecast: Array<{ periodStart: number; periodEnd: number; price: number; priceLevel: string | number }>
-  ) {
-    if (!this.tariffEndpoint) {
-      console.warn("[PriceServer] Endpoint not available");
-      return;
-    }
-    try {
-      await this.tariffEndpoint.act(async (agent: any) => {
-        // PriceForecast is a list of CommodityPriceStruct, max 56 entries
-        agent.commodityPrice.state.priceForecast = forecast.slice(0, 56).map(entry => ({
-          periodStart: entry.periodStart,
-          periodEnd: entry.periodEnd,
-          price: entry.price,
-          priceLevel: mapPriceLevel(entry.priceLevel),
-        }));
-      });
-      console.log(`[PriceServer] Updated PriceForecast: ${forecast.length} entries`);
-    } catch (e) {
-      console.warn("[PriceServer] Error updating PriceForecast:", e);
     }
   }
 
