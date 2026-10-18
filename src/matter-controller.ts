@@ -1,6 +1,5 @@
 import { Environment, Seconds } from "@matter/main";
 import { BasicInformationClient } from "@matter/main/behaviors/basic-information";
-import { DescriptorClient } from "@matter/main/behaviors/descriptor";
 import { AccessControlClient } from "@matter/main/behaviors/access-control";
 import { BindingClient } from "@matter/main/behaviors/binding";
 import { CommodityPriceClient } from "@matter/main/behaviors/commodity-price";
