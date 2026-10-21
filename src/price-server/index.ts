@@ -103,6 +103,14 @@ export class PriceServer {
       // Mandatory attributes must be initialised or behavior initialisation fails conformance
       this.tariffEndpoint = await this.serverNode.add(ComposedTariffDevice, {
         id: "energy-tariff-endpoint",
+        // The device type requires the Descriptor TagList feature with the ElectricalEnergy tag, plus Current as this
+        // is the active tariff (matter.js 0.18 enforces the 1 to 6 entry constraint)
+        descriptor: {
+          tagList: [
+            { mfgCode: null, namespaceId: 0x0d, tag: 0x00 }, // Commodity Tariff Commodity: ElectricalEnergy
+            { mfgCode: null, namespaceId: 0x0b, tag: 0x00 }, // Commodity Tariff Chronology: Current
+          ],
+        },
         commodityPrice: {
           tariffUnit: 0, // kWh
           currency: { currency: 826, decimalPoints: 4 }, // GBP, prices in 1/100 pence
