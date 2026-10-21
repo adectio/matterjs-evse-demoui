@@ -1,4 +1,4 @@
-import { Environment, Seconds } from "@matter/main";
+import { Endpoint, Environment, Seconds } from "@matter/main";
 import { BasicInformationClient } from "@matter/main/behaviors/basic-information";
 import { AccessControlClient } from "@matter/main/behaviors/access-control";
 import { BindingClient } from "@matter/main/behaviors/binding";
@@ -165,11 +165,13 @@ export class MatterControllerService {
     #evseChangeListeners = new Set<() => void>();
     #subscribedNodeIds = new Set<string>();
     /**
-     * Latest DEM Forecast per "nodeId/endpointId", taken from attribute reports. matter.js 0.17 doesn't refresh its
-     * cached views of list elements when a remote value replaces a list, so reading slots via the client state can
-     * return stale entries (e.g. the first slot of an earlier forecast).
+     * Latest DEM Forecast per "nodeId/endpointId", as the raw value passed to forecast$Changed. Once the Forecast has
+     * been null, matter.js (0.17.9 - 0.18.0) never refreshes its cached views of the slots list, so the client state
+     * (and the attributeChanged value, which is the same view) shows a new forecast's header with an old forecast's
+     * slots. The $Changed event is given the decoded value rather than the view.
      */
     #forecasts = new Map<string, DemForecast | null>();
+    #forecastObservers = new Set<string>();
 
     async start() {
         if (this.#controller !== undefined) return;
@@ -464,6 +466,9 @@ export class MatterControllerService {
             const demEndpoints = endpoints.filter(
                 endpoint => endpoint.maybeStateOf(DeviceEnergyManagementClient) !== undefined,
             );
+            for (const demEndpoint of demEndpoints) {
+                this.observeForecast(nodeId.toString(), demEndpoint);
+            }
             for (const endpoint of endpoints) {
                 const state = endpoint.maybeStateOf(EnergyEvseClient);
                 if (state === undefined) continue;
@@ -725,6 +730,7 @@ export class MatterControllerService {
         this.#controller = undefined;
         this.#subscribedNodeIds.clear();
         this.#forecasts.clear();
+        this.#forecastObservers.clear();
     }
 
     get controller() {
@@ -736,10 +742,7 @@ export class MatterControllerService {
 
     private subscribeToEvseChanges(node: Awaited<ReturnType<CommissioningController["getNode"]>>, nodeId: string) {
         if (this.#subscribedNodeIds.has(nodeId)) return;
-        node.events.attributeChanged.on(({ path, value }) => {
-            if (path.clusterId === DeviceEnergyManagementCluster.id && path.attributeName === "forecast") {
-                this.#forecasts.set(`${nodeId}/${path.endpointId}`, value as DemForecast | null);
-            }
+        node.events.attributeChanged.on(({ path }) => {
             if (
                 path.clusterId === EnergyEvseCluster.id ||
                 path.clusterId === ElectricalPowerMeasurementCluster.id ||
@@ -749,6 +752,18 @@ export class MatterControllerService {
             }
         });
         this.#subscribedNodeIds.add(nodeId);
+    }
+
+    /** Keeps #forecasts up to date for a DEM endpoint (see #forecasts for why the client state isn't used) */
+    private observeForecast(nodeId: string, endpoint: Endpoint) {
+        const key = `${nodeId}/${endpoint.number}`;
+        if (this.#forecastObservers.has(key)) return;
+        endpoint.eventsOf(DeviceEnergyManagementClient).forecast$Changed.on(value => {
+            this.#forecasts.set(key, value as DemForecast | null);
+            // attributeChanged may have already prompted a refresh which read the previous value
+            for (const listener of this.#evseChangeListeners) listener();
+        });
+        this.#forecastObservers.add(key);
     }
 
     private async getEvseEndpoint(nodeId: string, endpointId: string) {
