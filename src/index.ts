@@ -16,6 +16,7 @@ const host = process.env.HOST ?? "0.0.0.0";
 const publicDirectory = join(process.cwd(), "public");
 const controller = new MatterControllerService();
 let priceServer: any = null;
+const versions = await readVersions();
 
 assertNodeVersion();
 await controller.start();
@@ -102,6 +103,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
     if (request.method === "GET" && url.pathname === "/api/health") {
         sendJson(response, 200, { status: "ready" });
+        return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/version") {
+        sendJson(response, 200, versions);
         return;
     }
 
@@ -454,6 +460,21 @@ function requiredNonNegativeChargeCurrent(value: unknown, name: string) {
         throw new Error(`"${name}" must not be negative.`);
     }
     return current;
+}
+
+/** The app and matter.js versions, shown in the sidebar (@matter/main doesn't export its package.json) */
+async function readVersions() {
+    const versionOf = async (path: string) => {
+        try {
+            return (JSON.parse(await readFile(join(process.cwd(), path), "utf8")) as { version?: string }).version ?? null;
+        } catch {
+            return null;
+        }
+    };
+    return {
+        app: await versionOf("package.json"),
+        matterJs: await versionOf("node_modules/@matter/main/package.json"),
+    };
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
