@@ -11,7 +11,7 @@
       <a class="brand" href="/" aria-label="Adectio home">
         <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
       </a>
-      <nav aria-label="Main navigation"><a href="/">Admin</a><a class="active" href="/evse.html">EVSE</a><a href="/charging-preferences.html">Charging preferences</a></nav>
+      <nav aria-label="Main navigation"><a href="/">Admin</a><a class="active" href="/evse.html">EVSE</a><a href="/charging-preferences.html">Charging preferences</a><a href="/price-forecast.html">Price & Grid Forecast</a><a href="/config.html">Configuration</a></nav>
     </aside>
     <main>
       <header>
@@ -31,6 +31,8 @@
       <div id="evse-list"></div>
       <output id="status" aria-live="polite"></output>
     </main>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
     <script type="module" src="/evse.js"></script>
+    <script src="/version.js" defer></script>
   </body>
 </html>

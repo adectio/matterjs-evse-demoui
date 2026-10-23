@@ -18,6 +18,7 @@ nav { display: grid; gap: .35rem; }
 nav a { border-radius: 7px; color: #506077; font-weight: 650; padding: .75rem; text-decoration: none; }
 nav a:hover { background: var(--adectio-blue-pale); color: var(--adectio-blue-dark); }
 nav a.active { background: var(--adectio-blue-pale); color: var(--adectio-blue-dark); }
+.app-version { color: var(--muted); font-size: .75rem; margin: auto .75rem 0; }
 main { margin-left: 228px; max-width: 950px; padding: 3.5rem; }
 header { margin-bottom: 2rem; }
 h1, h2, p { margin-top: 0; }
@@ -39,6 +40,13 @@ ul { display: grid; gap: .75rem; list-style: none; margin: 0; padding: 0; }
 li { background: #f8fbff; border: 1px solid #e4ebf5; border-radius: 8px; padding: .75rem; }
 li code { margin-right: auto; overflow-wrap: anywhere; }
 li small { color: #64748b; margin-right: auto; }
+/* Rows share one set of columns (subgrid) so the buttons line up whatever the product name */
+#device-list { grid-template-columns: minmax(0, 1fr) repeat(5, auto); }
+li.node-row { align-items: center; column-gap: .5rem; display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
+.node-info { display: grid; gap: .2rem; min-width: 0; }
+.node-info code { margin: 0; overflow-wrap: normal; white-space: nowrap; }
+.node-info small { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-info .node-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .danger { border-color: #f0bac1; }
 .danger-button { background: #c83f54; color: #fff; }
 output { display: block; margin-top: 1rem; min-height: 1.5rem; }
@@ -66,6 +74,12 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
 .user-current-limit-controls input { padding: 0; width: 100%; }
 .user-current-limit-controls output { margin: 0; min-height: 0; }
 .node-selector { display: grid; gap: .5rem; }
+.forecast-chart { height: 280px; margin-top: 1rem; position: relative; }
+.forecast-slots { border-collapse: collapse; font-size: .85rem; margin-top: 1rem; width: 100%; }
+.forecast-slots th { color: var(--muted); font-weight: 650; text-align: left; }
+.forecast-slots th, .forecast-slots td { border-bottom: 1px solid var(--line); padding: .45rem .5rem; }
+.forecast-slots tr.active td { background: var(--adectio-blue-pale); font-weight: 650; }
+.forecast-slots tr.idle td { color: var(--muted); }
 .preferences-selector { display: grid; gap: .5rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .preferences-selector label { font-weight: 650; }
 .preferences-selector select { grid-row: 2; }
@@ -73,7 +87,9 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
 .day-toggle { background: #fff; border: 1px solid #a9b7c8; color: #40516a; min-width: 3.5rem; }
 .day-toggle[aria-pressed="true"] { background: var(--adectio-blue); border-color: var(--adectio-blue); color: #fff; }
 .target-list { display: grid; gap: .75rem; }
-.target-row { align-items: end; background: #f8fbff; border: 1px solid #e4ebf5; border-radius: 8px; display: grid; gap: .65rem; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; padding: .75rem; }
+.target-row { align-items: end; background: #f8fbff; border: 1px solid #e4ebf5; border-radius: 8px; display: grid; gap: .65rem; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); padding: .75rem; }
+.target-row .checkbox-label { align-items: center; display: flex; gap: .5rem; padding-bottom: .65rem; }
+.target-row .target-hint { font-size: .8rem; grid-column: 1 / -1; margin: 0; }
 .target-row label { display: grid; font-size: .85rem; font-weight: 650; gap: .35rem; }
 .input-group { display: flex; }
 .input-group input { border-radius: 7px 0 0 7px; min-width: 0; width: 100%; }
@@ -97,6 +113,11 @@ h3 { border-top: 1px solid var(--line); font-size: .9rem; margin: 1.5rem 0 .75re
   .brand img { max-width: 112px; }
   nav { display: flex; }
   nav a { padding: .45rem .65rem; }
+  .app-version { display: none; }
   main { margin: 0; padding: 2rem 1rem; }
   .charging-controls, .user-current-limit-controls { grid-template-columns: 1fr; }
+  #device-list { grid-template-columns: 1fr; }
+  li.node-row { display: flex; flex-wrap: wrap; gap: .5rem; }
+  li.node-row .node-info { flex-basis: 100%; }
+  li.node-row > span:empty { display: none; }
 }

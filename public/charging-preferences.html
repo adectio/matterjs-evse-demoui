@@ -11,7 +11,7 @@
       <a class="brand" href="/" aria-label="Adectio home">
         <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
       </a>
-      <nav aria-label="Main navigation"><a href="/">Admin</a><a href="/evse.html">EVSE</a><a class="active" href="/charging-preferences.html">Charging preferences</a></nav>
+      <nav aria-label="Main navigation"><a href="/">Admin</a><a href="/evse.html">EVSE</a><a class="active" href="/charging-preferences.html">Charging preferences</a><a href="/price-forecast.html">Price & Grid Forecast</a><a href="/config.html">Configuration</a></nav>
     </aside>
     <main>
       <header>
@@ -48,7 +48,7 @@
               <option value="kwh-per-100km">kWh/100 km</option>
             </select>
           </div>
-          <p class="muted">Required for range targets. The selected convention also sets the range target unit; Matter stores efficiency as km/kWh × 1000.</p>
+          <p class="muted">Required when a target includes an added range. The selected convention also sets the range target unit; Matter stores efficiency as km/kWh × 1000.</p>
         </div>
         <div class="button-row">
           <button id="save-targets" type="button">Set targets</button>
@@ -64,5 +64,6 @@
       <output id="status" aria-live="polite"></output>
     </main>
     <script type="module" src="/charging-preferences.js"></script>
+    <script src="/version.js" defer></script>
   </body>
 </html>

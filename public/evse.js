@@ -5,6 +5,20 @@ const nodeSelect = document.querySelector("#node-select");
 let updateTimer;
 let chargingControlsActive = false;
 let refreshPending = false;
+// Chart.js instances keyed by chart id, kept across the frequent card re-renders so tooltips stay usable
+const forecastCharts = new Map();
+let priceForecastCache = { fetchedAt: 0, data: null };
+let carbonForecastCache = { fetchedAt: 0, data: null };
+// Tariff and carbon data behind the cards being rendered (for slot costs the EVSE doesn't report)
+let renderPrices = null;
+let renderCarbon = null;
+const PRICE_FORECAST_MAX_AGE_MS = 5 * 60 * 1000;
+
+const ForecastUpdateReason = Object.freeze({
+    InternalOptimization: 0,
+    LocalOptimization: 1,
+    GridOptimization: 2,
+});
 
 const EnergyEvseState = Object.freeze({
     NotPluggedIn: 0,
@@ -57,7 +71,7 @@ async function loadNodes() {
         if (!response.ok) throw new Error(error ?? "Unable to list commissioned nodes.");
 
         const previouslySelected = localStorage.getItem("selectedMatterNodeId");
-        nodeSelect.replaceChildren(...nodes.map(node => new Option(`Node ${node.nodeId}`, node.nodeId)));
+        nodeSelect.replaceChildren(...nodes.map(node => new Option(nodeLabel(node), node.nodeId)));
         nodeSelect.disabled = nodes.length === 0;
 
         if (nodes.some(node => node.nodeId === previouslySelected)) {
@@ -88,7 +102,12 @@ async function loadEvses() {
         const response = await fetch(`/api/evses?nodeId=${encodeURIComponent(nodeSelect.value)}`);
         const { evses, error } = await response.json();
         if (!response.ok) throw new Error(error ?? "Unable to retrieve EVSE state.");
+        const hasForecast = evses.some(evse => evse.forecast !== null);
+        const [prices, carbon] = hasForecast ? await Promise.all([loadPriceForecast(), loadCarbonForecast()]) : [null, null];
+        renderPrices = prices;
+        renderCarbon = carbon;
         evseList.replaceChildren(...evses.map(renderEvse));
+        placeForecastCharts(evses, prices, carbon);
         emptyState.hidden = evses.length > 0;
         status.textContent = evses.length ? `Live updates connected for ${evses.length} EVSE endpoint(s).` : "";
         status.className = "";
@@ -132,7 +151,7 @@ function renderEvse(evse) {
     const faultActive = hasActiveFault(evse);
     card.innerHTML = `
       <div class="section-heading">
-        <div><h2>EVSE endpoint ${evse.endpointId}</h2><p class="muted"><code>Node ${evse.nodeId}</code></p></div>
+        <div><h2>EVSE endpoint ${evse.endpointId}</h2><p class="muted"><code>Node ${displayNodeId(evse.nodeId)}</code></p></div>
         <span class="badge ${evse.state === EnergyEvseState.Charging ? "good" : ""}">${stateLabel(evse.state)}</span>
       </div>
       <h3>Main status</h3>
@@ -160,7 +179,8 @@ function renderEvse(evse) {
         ${metric("Required energy", energy(evse.nextChargeRequiredEnergy))}
         ${metric("Target SoC", percent(evse.nextChargeTargetSoC))}
         ${metric("Charging enabled until", chargingEnabledUntil(evse))}
-      </dl>`;
+      </dl>
+      ${renderForecast(evse)}`;
 
     card.append(createUserChargeLimitControls(evse));
     if (faultActive) {
@@ -343,6 +363,430 @@ function showChargingError(message, control) {
     control.classList.remove("is-busy");
 }
 
+function forecastChartId(evse) {
+    return `forecast-chart-${evse.nodeId}-${evse.endpointId}`;
+}
+
+function renderForecast(evse) {
+    const forecast = evse.forecast;
+    if (forecast === null) {
+        return `
+      <h3>Charging forecast</h3>
+      <p class="muted">No Device Energy Management forecast. The EVSE publishes one when an EV is plugged in, charging is enabled and a charging target is set.</p>`;
+    }
+
+    const plannedEnergy = forecast.slots.reduce((total, slot) => total + (slot.nominalEnergy ?? 0), 0);
+    const costs = forecast.slots.map(slotCost);
+    const totals = totalCosts(forecast.slots, costs);
+    const rows = forecast.slots
+        .map((slot, index) => {
+            const charging = (slot.nominalPower ?? 0) > 0;
+            const rowClass = index === forecast.activeSlotNumber ? "active" : charging ? "" : "idle";
+            return `<tr class="${rowClass}">
+              <td>${index + 1}</td>
+              <td>${clockTime(slot.startTime)}</td>
+              <td>${shortDuration(slot.duration)}</td>
+              <td>${charging ? power(slot.nominalPower) : "Off"}</td>
+              <td>${charging ? energy(slot.nominalEnergy) : "—"}</td>
+              <td>${charging ? money(costs[index].cost, costs[index].estimated) : "—"}</td>
+              <td>${charging ? emissions(costs[index].ghgGrams, costs[index].estimated) : "—"}</td>
+            </tr>`;
+        })
+        .join("");
+
+    return `
+      <h3>Charging forecast</h3>
+      <dl class="metrics">
+        ${metric("Forecast ID", forecast.forecastId)}
+        ${metric("Starts", time(forecast.startTime))}
+        ${metric("Ends", time(forecast.endTime))}
+        ${metric("Must finish by", forecast.latestEndTime === null ? "Not set" : time(forecast.latestEndTime))}
+        ${metric("Planned energy", energy(plannedEnergy))}
+        ${metric("Planned cost", money(totals.cost, totals.estimated) + (totals.usesEstimatedPrices ? " <small>(includes estimated prices)</small>" : ""))}
+        ${metric("Planned CO₂", emissions(totals.ghgGrams, totals.estimated))}
+        ${metric("Planned by", forecastReasonLabel(forecast.forecastUpdateReason))}
+      </dl>
+      <div class="forecast-chart" data-chart-id="${forecastChartId(evse)}"></div>
+      <table class="forecast-slots">
+        <thead><tr><th>Slot</th><th>Start</th><th>Duration</th><th>Power</th><th>Energy</th><th>Cost</th><th>CO₂</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+}
+
+const CURRENCY_SYMBOLS = { 826: "£", GBP: "£", 978: "€", EUR: "€" };
+
+/**
+ * A slot's cost and CO2, as reported by the EVSE (DEM slot Costs) or, if it doesn't report them (e.g. the flat
+ * tariff build), estimated here from the tariff and carbon data shown on the chart.
+ */
+function slotCost(slot) {
+    if ((slot.nominalPower ?? 0) <= 0) return { cost: null, ghgGrams: null, estimated: false };
+    const reported = slot.financialCost !== null || slot.ghgEmissionsGrams !== null;
+    if (reported) {
+        return {
+            cost: slot.financialCost && { value: slot.financialCost.value, currency: slot.financialCost.currency },
+            ghgGrams: slot.ghgEmissionsGrams,
+            estimated: false,
+        };
+    }
+    // Prices are in pence (after the metadata decimal points), so the cost in pounds is a hundredth of the sum
+    const decimals = renderPrices?.metadata?.decimals ?? 2;
+    const pricePeriods = [...(renderPrices?.forecast ?? []), ...(renderPrices?.estimated ?? [])];
+    const pence = integrateOverPeriods(slot, pricePeriods, period => (period.price ?? NaN) / 10 ** decimals);
+    const grams = integrateOverPeriods(slot, renderCarbon?.forecast ?? [], period => period.gridCarbonIntensity ?? NaN);
+    return {
+        cost: pence === null ? null : { value: pence / 100, currency: renderPrices?.metadata?.currency ?? "GBP" },
+        ghgGrams: grams,
+        estimated: true,
+    };
+}
+
+/** Energy (kWh) x value per kWh across the periods a slot spans; null if any part isn't covered */
+function integrateOverPeriods(slot, periods, valuePerKwh) {
+    const end = slot.startTime + slot.duration;
+    const powerKw = (slot.nominalPower ?? 0) / 1_000_000;
+    let total = 0;
+    for (let time = slot.startTime; time < end; ) {
+        const period = periods.find(p => p.periodStart <= time && time < (p.periodEnd ?? p.periodStart + 1800));
+        if (!period) return null;
+        const value = valuePerKwh(period);
+        if (!Number.isFinite(value)) return null;
+        const until = Math.min(end, period.periodEnd ?? period.periodStart + 1800);
+        total += powerKw * ((until - time) / 3600) * value;
+        time = until;
+    }
+    return total;
+}
+
+function totalCosts(slots, costs) {
+    const charging = costs.filter((_, index) => (slots[index].nominalPower ?? 0) > 0);
+    const known = values => (values.every(value => value !== null) ? values : null);
+    const costValues = known(charging.map(cost => cost.cost));
+    const ghgValues = known(charging.map(cost => cost.ghgGrams));
+    // Slots in the period after the published tariff use estimated prices
+    const estimatedFrom = Math.min(...(renderPrices?.estimated ?? []).map(period => period.periodStart));
+    return {
+        cost: costValues && charging.length
+            ? { value: costValues.reduce((sum, cost) => sum + cost.value, 0), currency: costValues[0].currency }
+            : null,
+        ghgGrams: ghgValues && charging.length ? ghgValues.reduce((sum, grams) => sum + grams, 0) : null,
+        estimated: charging.some(cost => cost.estimated),
+        usesEstimatedPrices: slots.some(slot => (slot.nominalPower ?? 0) > 0 && slot.startTime + slot.duration > estimatedFrom),
+    };
+}
+
+function money(cost, estimated) {
+    if (!cost) return "Unavailable";
+    const symbol = CURRENCY_SYMBOLS[cost.currency] ?? "";
+    return `${symbol}${cost.value.toFixed(2)}${symbol ? "" : ` ${cost.currency ?? ""}`}${estimated ? " (est.)" : ""}`;
+}
+
+function emissions(grams, estimated) {
+    if (grams === null || grams === undefined) return "Unavailable";
+    const text = grams >= 1000 ? `${(grams / 1000).toFixed(2)} kg` : `${Math.round(grams)} g`;
+    return `${text}${estimated ? " (est.)" : ""}`;
+}
+
+function forecastReasonLabel(value) {
+    return {
+        [ForecastUpdateReason.InternalOptimization]: "EVSE (internal optimisation)",
+        [ForecastUpdateReason.LocalOptimization]: "Local energy manager",
+        [ForecastUpdateReason.GridOptimization]: "Grid",
+    }[value] ?? `Unknown (${value})`;
+}
+
+async function loadPriceForecast() {
+    if (Date.now() - priceForecastCache.fetchedAt < PRICE_FORECAST_MAX_AGE_MS) return priceForecastCache.data;
+    let data = null;
+    try {
+        const response = await fetch(`/api/commodity-price/forecast?hours=48&from=${chartHistoryFrom()}`);
+        if (response.ok) data = await response.json();
+    } catch {
+        // The tariff overlay is optional
+    }
+    priceForecastCache = { fetchedAt: Date.now(), data };
+    return data;
+}
+
+/**
+ * Re-use each existing chart when its inputs haven't changed (EVSE session counters change every second),
+ * otherwise draw a new one. Charts are redrawn at least once a minute so the "Now" marker moves.
+ */
+/** A forecast can have started a while ago (its first slot still running), so fetch some history too */
+function chartHistoryFrom() {
+    return Math.floor(Date.now() / 1000) - 6 * 3600;
+}
+
+async function loadCarbonForecast() {
+    if (Date.now() - carbonForecastCache.fetchedAt < PRICE_FORECAST_MAX_AGE_MS) return carbonForecastCache.data;
+    let data = null;
+    try {
+        const response = await fetch(`/api/grid-conditions/forecast?region=uk&hours=48&from=${chartHistoryFrom()}`);
+        if (response.ok) data = await response.json();
+    } catch {
+        // The carbon overlay is optional
+    }
+    carbonForecastCache = { fetchedAt: Date.now(), data };
+    return data;
+}
+
+function placeForecastCharts(evses, prices, carbon) {
+    const placed = new Set();
+    for (const evse of evses) {
+        const id = forecastChartId(evse);
+        const placeholder = evseList.querySelector(`[data-chart-id="${id}"]`);
+        if (evse.forecast === null || placeholder === null || typeof Chart === "undefined") continue;
+
+        const signature = JSON.stringify([
+            evse.forecast,
+            priceForecastCache.fetchedAt,
+            carbonForecastCache.fetchedAt,
+            Math.floor(Date.now() / 60_000),
+        ]);
+        const existing = forecastCharts.get(id);
+        if (existing?.signature === signature) {
+            placeholder.replaceWith(existing.container);
+        } else {
+            existing?.chart.destroy();
+            const canvas = document.createElement("canvas");
+            canvas.setAttribute("aria-label", "Forecast charging power and tariff");
+            placeholder.append(canvas);
+            forecastCharts.set(id, { chart: drawForecastChart(canvas, evse.forecast, prices, carbon), container: placeholder, signature });
+        }
+        placed.add(id);
+    }
+
+    for (const [id, entry] of forecastCharts) {
+        if (placed.has(id)) continue;
+        entry.chart.destroy();
+        forecastCharts.delete(id);
+    }
+}
+
+function drawForecastChart(canvas, forecast, prices, carbon) {
+    const now = Date.now();
+    // A margin either side keeps the "Now" and "Must finish by" lines inside the plot rather than on its edges
+    const MARGIN_MS = 15 * 60 * 1000;
+    const xMin = Math.min(now, forecast.startTime * 1000) - MARGIN_MS;
+    const xMax = Math.max(forecast.endTime, forecast.latestEndTime ?? 0) * 1000 + MARGIN_MS;
+
+    // Each slot holds its power until the next slot starts
+    const powerPoints = forecast.slots.map(slot => ({ x: slot.startTime * 1000, y: (slot.nominalPower ?? 0) / 1_000_000 }));
+    powerPoints.push({ x: forecast.endTime * 1000, y: 0 });
+    const maxPower = Math.max(1, ...forecast.slots.map(slot => (slot.maxPower ?? slot.nominalPower ?? 0) / 1_000_000));
+
+    const datasets = [
+        {
+            label: "Forecast power (kW)",
+            data: powerPoints,
+            pointStyle: "rect",
+            // Chart.js "before": hold each value until the next point (a slot keeps its power until the next slot)
+            stepped: "before",
+            fill: "origin",
+            borderColor: "#0073e6",
+            backgroundColor: "rgba(0, 115, 230, 0.25)",
+            pointRadius: 0,
+            yAxisID: "power",
+        },
+    ];
+    const markers = [{ x: now, label: "Now", color: "#60708a" }];
+    if (forecast.latestEndTime !== null) {
+        markers.push({ x: forecast.latestEndTime * 1000, label: "Must finish by", color: "#c83f54" });
+    }
+
+    const decimals = prices?.metadata?.decimals ?? 2;
+    const pricePoints = (prices?.forecast ?? [])
+        .filter(period => period.price !== null && period.periodEnd * 1000 > xMin && period.periodStart * 1000 < xMax)
+        .sort((a, b) => a.periodStart - b.periodStart)
+        .flatMap((period, index, periods) => {
+            const point = { x: period.periodStart * 1000, y: period.price / 10 ** decimals };
+            // Close off the final period
+            return index === periods.length - 1 ? [point, { x: period.periodEnd * 1000, y: point.y }] : [point];
+        });
+    const estimatedPoints = (prices?.estimated ?? [])
+        .filter(period => period.periodEnd * 1000 > xMin && period.periodStart * 1000 < xMax)
+        .sort((a, b) => a.periodStart - b.periodStart)
+        .flatMap((period, index, periods) => {
+            const point = { x: period.periodStart * 1000, y: period.price / 10 ** decimals };
+            return index === periods.length - 1 ? [point, { x: period.periodEnd * 1000, y: point.y }] : [point];
+        });
+    const tariffUnit = prices?.metadata?.currency === "GBP" || prices?.metadata?.currency === undefined ? "p" : prices.metadata.currency;
+    if (pricePoints.length > 0) {
+        datasets.push({
+            label: `${prices.priceSource?.name ?? "Tariff"} (${tariffUnit}/kWh)`,
+            data: pricePoints,
+            stepped: "before",
+            pointStyle: "line",
+            borderColor: "#f57c00",
+            borderWidth: 1.5,
+            pointRadius: 0,
+            yAxisID: "price",
+        });
+    }
+
+    if (estimatedPoints.length > 0) {
+        datasets.push({
+            label: `Estimated tariff (${tariffUnit}/kWh)`,
+            data: estimatedPoints,
+            stepped: "before",
+            pointStyle: "line",
+            borderColor: "#f57c00",
+            borderDash: [6, 4],
+            borderWidth: 1.5,
+            pointRadius: 0,
+            yAxisID: "price",
+        });
+    }
+
+    const carbonPoints = (carbon?.forecast ?? [])
+        .filter(period => period.gridCarbonIntensity != null && (period.periodEnd ?? period.periodStart + 1800) * 1000 > xMin && period.periodStart * 1000 < xMax)
+        .sort((a, b) => a.periodStart - b.periodStart)
+        .flatMap((period, index, periods) => {
+            const point = { x: period.periodStart * 1000, y: period.gridCarbonIntensity };
+            const end = (period.periodEnd ?? period.periodStart + 1800) * 1000;
+            return index === periods.length - 1 ? [point, { x: end, y: point.y }] : [point];
+        });
+    if (carbonPoints.length > 0) {
+        datasets.push({
+            label: "Grid carbon (gCO₂/kWh)",
+            data: carbonPoints,
+            stepped: "before",
+            pointStyle: "line",
+            borderColor: "#2e7d32",
+            borderWidth: 1.5,
+            pointRadius: 0,
+            yAxisID: "carbon",
+        });
+    }
+
+    alignStepSeries(datasets, xMin, xMax);
+
+    return new Chart(canvas, {
+            type: "line",
+            data: { datasets },
+            plugins: [markerLinesPlugin],
+            options: {
+                animation: false,
+                maintainAspectRatio: false,
+                parsing: false,
+                interaction: { mode: "nearest", axis: "x", intersect: false },
+                plugins: {
+                    legend: { position: "top", labels: { usePointStyle: true } },
+                    markerLines: { markers },
+                    tooltip: {
+                        // Every series has a point at the same times (see alignStepSeries), so all appear together
+                        callbacks: { title: items => (items.length ? clockTime(items[0].parsed.x / 1000) : "") },
+                    },
+                },
+                scales: {
+                    x: {
+                        type: "linear",
+                        min: xMin,
+                        max: xMax,
+                        ticks: { callback: value => clockTime(value / 1000), maxRotation: 0 },
+                    },
+                    power: {
+                        position: "left",
+                        beginAtZero: true,
+                        suggestedMax: maxPower,
+                        title: { display: true, text: "kW" },
+                    },
+                    price: {
+                        display: pricePoints.length > 0 || estimatedPoints.length > 0,
+                        position: "right",
+                        beginAtZero: true,
+                        grid: { drawOnChartArea: false },
+                        title: { display: true, text: "Tariff" },
+                    },
+                    carbon: {
+                        display: carbonPoints.length > 0,
+                        position: "right",
+                        beginAtZero: true,
+                        grid: { drawOnChartArea: false },
+                        title: { display: true, text: "gCO₂/kWh" },
+                    },
+                },
+            },
+        });
+}
+
+/** Labelled vertical lines (e.g. "Now") drawn over the chart; they aren't data, so stay out of the legend and tooltip */
+const markerLinesPlugin = {
+    id: "markerLines",
+    afterDatasetsDraw(chart, _args, options) {
+        const { ctx, chartArea, scales } = chart;
+        for (const marker of options.markers ?? []) {
+            const x = scales.x.getPixelForValue(marker.x);
+            if (x < chartArea.left || x > chartArea.right) continue;
+            ctx.save();
+            ctx.strokeStyle = marker.color;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(x, chartArea.top);
+            ctx.lineTo(x, chartArea.bottom);
+            ctx.stroke();
+            // Label beside the line, flipped to the left near the right-hand edge
+            const nearRight = x > chartArea.right - 100;
+            ctx.setLineDash([]);
+            ctx.fillStyle = marker.color;
+            ctx.font = "12px sans-serif";
+            ctx.textAlign = nearRight ? "right" : "left";
+            ctx.fillText(marker.label, x + (nearRight ? -4 : 4), chartArea.top + 12);
+            ctx.restore();
+        }
+    },
+};
+
+const HALF_HOUR_MS = 30 * 60 * 1000;
+
+/**
+ * Resample step series (each holding its value until its next point) onto one shared set of times: every half
+ * hour plus every point where any series changes. The lines draw the same, but the tooltip's nearest-point lookup
+ * then finds every series at the same time, rather than only the one that changes most often (e.g. carbon versus
+ * a custom tariff with a few long periods).
+ */
+function alignStepSeries(datasets, xMin, xMax) {
+    const times = new Set();
+    for (let x = Math.floor(xMin / HALF_HOUR_MS) * HALF_HOUR_MS; x <= xMax; x += HALF_HOUR_MS) times.add(x);
+    for (const dataset of datasets) for (const point of dataset.data) times.add(point.x);
+    const grid = [...times].sort((a, b) => a - b);
+
+    for (const dataset of datasets) {
+        const points = dataset.data;
+        if (points.length === 0) continue;
+        const first = points[0].x;
+        const last = points[points.length - 1].x;
+        let index = 0;
+        dataset.data = grid
+            .filter(x => x >= first && x <= last)
+            .map(x => {
+                while (index + 1 < points.length && points[index + 1].x <= x) index++;
+                return { x, y: points[index].y };
+            });
+    }
+}
+
+function clockTime(seconds) {
+    return new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(seconds * 1000));
+}
+
+function shortDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.round((seconds % 3600) / 60);
+    return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+/** Node IDs are shown in hex, as in Matter tooling (the API still uses decimal) */
+function displayNodeId(nodeId) {
+    return `0x${BigInt(nodeId).toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+function nodeLabel(node) {
+    if (node.nodeName) return `${node.nodeName} (${displayNodeId(node.nodeId)})`;
+    return [`Node ${displayNodeId(node.nodeId)}`, node.productName].filter(Boolean).join(" · ");
+}
+
 function metric(name, value, status = "") {
     return `<div class="${status}"><dt>${name}</dt><dd>${value}</dd></div>`;
 }
@@ -492,9 +936,8 @@ function percent(value) {
 function time(value) {
     if (value === null) return "Unavailable";
     if (value === 0) return "Not scheduled";
-    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
-        new Date(Date.UTC(2000, 0, 1) + value * 1000),
-    );
+    // matter.js already converts Matter epoch-s values to Unix seconds
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value * 1000));
 }
 
 function chargingEnabledUntil(evse) {

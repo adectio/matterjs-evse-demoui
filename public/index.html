@@ -11,7 +11,7 @@
       <a class="brand" href="/" aria-label="Adectio home">
         <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
       </a>
-      <nav aria-label="Main navigation"><a class="active" href="/">Admin</a><a href="/evse.html">EVSE</a><a href="/charging-preferences.html">Charging preferences</a></nav>
+      <nav aria-label="Main navigation"><a class="active" href="/">Admin</a><a href="/evse.html">EVSE</a><a href="/charging-preferences.html">Charging preferences</a><a href="/price-forecast.html">Price & Grid Forecast</a><a href="/config.html">Configuration</a></nav>
     </aside>
     <main>
       <header>
@@ -29,6 +29,21 @@
           <input id="discriminator" name="discriminator" inputmode="numeric" autocomplete="off" min="0" max="4095" placeholder="0–4095" />
           <button type="submit">Commission device</button>
         </form>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <h2>Local price server</h2>
+          <div class="button-row">
+            <button id="commission-price-server">Commission price server</button>
+            <button id="reset-price-server" class="secondary">Reset price server</button>
+          </div>
+        </div>
+        <p class="muted">The built-in Electrical Energy Tariff device (CommodityPrice and ElectricalGridConditions). It uses its own pairing code, so it cannot be confused with an EVSE. Once commissioned, every device with CommodityPrice or ElectricalGridConditions client clusters and a Binding cluster (EVSEs, appliances, …) is bound to it.</p>
+        <div id="price-server-qr" class="qr-code" role="img" aria-label="Price server QR code"></div>
+        <label>Manual pairing code <code id="price-server-manual-code">—</code></label>
+        <label>Setup PIN / discriminator <code id="price-server-pin">—</code></label>
+        <output id="price-server-status" aria-live="polite"></output>
       </section>
 
       <section class="card">
@@ -67,5 +82,6 @@
       <output id="status" aria-live="polite"></output>
     </main>
     <script type="module" src="/app.js"></script>
+    <script src="/version.js" defer></script>
   </body>
 </html>

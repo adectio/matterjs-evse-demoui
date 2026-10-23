@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Configuration | Matter EVSE Demo</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    .config-container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+
+    .config-section {
+      background: white;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    .config-section h2 {
+      margin-top: 0;
+      font-size: 1.25rem;
+      color: #333;
+      border-bottom: 2px solid #1976d2;
+      padding-bottom: 0.5rem;
+    }
+
+    .form-group {
+      margin-bottom: 1.5rem;
+    }
+
+    label {
+      display: block;
+      font-weight: 500;
+      margin-bottom: 0.5rem;
+      color: #333;
+    }
+
+    input[type="text"],
+    input[type="password"],
+    input[type="number"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 1rem;
+      font-family: inherit;
+      box-sizing: border-box;
+    }
+
+    input[type="text"]:focus,
+    input[type="password"]:focus,
+    input[type="number"]:focus,
+    select:focus,
+    textarea:focus {
+      outline: none;
+      border-color: #1976d2;
+      box-shadow: 0 0 0 3px rgba(25, 118, 210, 0.1);
+    }
+
+    .help-text {
+      font-size: 0.875rem;
+      color: #666;
+      margin-top: 0.25rem;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+
+    @media (max-width: 768px) {
+      .form-row {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .toggle-group {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    input[type="checkbox"] {
+      width: 20px;
+      height: 20px;
+      cursor: pointer;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    button {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 4px;
+      font-size: 1rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: #1976d2;
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: #1565c0;
+    }
+
+    .btn-secondary {
+      background: #f5f5f5;
+      color: #333;
+      border: 1px solid #ddd;
+    }
+
+    .btn-secondary:hover {
+      background: #eeeeee;
+    }
+
+    .btn-danger {
+      background: #d32f2f;
+      color: white;
+    }
+
+    .btn-danger:hover {
+      background: #b71c1c;
+    }
+
+    .status-message {
+      padding: 1rem;
+      border-radius: 4px;
+      margin-bottom: 1rem;
+    }
+
+    .status-success {
+      background: #c8e6c9;
+      color: #1b5e20;
+      border: 1px solid #81c784;
+    }
+
+    .status-error {
+      background: #ffcdd2;
+      color: #b71c1c;
+      border: 1px solid #ef5350;
+    }
+
+    .status-info {
+      background: #bbdefb;
+      color: #0d47a1;
+      border: 1px solid #64b5f6;
+    }
+
+    .fetcher-status {
+      background: #f5f5f5;
+      padding: 1rem;
+      border-radius: 4px;
+      margin-top: 1rem;
+    }
+
+    .fetcher-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.75rem;
+      border-bottom: 1px solid #ddd;
+    }
+
+    .fetcher-item:last-child {
+      border-bottom: none;
+    }
+
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 0.5rem;
+    }
+
+    .status-active { background: #4caf50; }
+    .status-inactive { background: #9e9e9e; }
+
+    .custom-tariff {
+      background: #f9f9f9;
+      padding: 1rem;
+      border-radius: 4px;
+      margin-bottom: 1rem;
+      border-left: 4px solid #1976d2;
+    }
+
+    .tariff-timeline { border-radius: 4px; display: flex; height: 1.6rem; margin: 0.5rem 0 0.2rem; overflow: hidden; }
+    .tariff-timeline:empty { background: #eee; }
+    .tariff-timeline span { color: #fff; font-size: 0.7rem; line-height: 1.6rem; overflow: hidden; text-align: center; white-space: nowrap; }
+    .tariff-timeline-axis { color: #888; display: flex; font-size: 0.7rem; justify-content: space-between; margin-bottom: 0.75rem; }
+    .period-until { color: #555; font-size: 0.85rem; white-space: nowrap; }
+    .price-source-options { display: grid; gap: 0.75rem; margin: 1rem 0; }
+    .price-source-option { border: 1px solid #ddd; border-radius: 6px; padding: 0.9rem 1rem; }
+    .price-source-option.selected { border-color: #1976d2; background: #f3f8fe; }
+    .price-source-option.unavailable { opacity: 0.7; }
+    .price-source-choice { align-items: center; display: flex; gap: 0.6rem; margin: 0; }
+    .price-source-choice input { margin: 0; width: auto; }
+    .price-source-name { font-weight: 600; }
+    .price-source-badge { background: #1976d2; border-radius: 999px; color: #fff; font-size: 0.75rem; padding: 0.1rem 0.55rem; }
+    .price-source-status { color: #666; font-size: 0.85rem; margin: 0.35rem 0 0 1.6rem; }
+    .price-source-option .form-row { margin: 0.75rem 0 0 1.6rem; }
+    .price-source-option .form-group { margin-bottom: 0; }
+
+    .tariff-period {
+      display: grid;
+      grid-template-columns: 1fr minmax(7rem, auto) 1fr 1fr 2fr auto;
+      gap: 0.5rem;
+      align-items: end;
+      margin-bottom: 0.5rem;
+    }
+
+    @media (max-width: 768px) {
+      .tariff-period {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .cache-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .stat-box {
+      background: #f5f5f5;
+      padding: 1rem;
+      border-radius: 4px;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: #1976d2;
+    }
+
+    .stat-label {
+      font-size: 0.875rem;
+      color: #666;
+      margin-top: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Adectio home">
+      <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="/">Admin</a>
+      <a href="/evse.html">EVSE</a>
+      <a href="/charging-preferences.html">Charging preferences</a>
+      <a href="/price-forecast.html">Price & Grid Forecast</a>
+      <a class="active" href="/config.html">Configuration</a>
+    </nav>
+  </aside>
+
+  <main>
+    <header>
+      <p class="eyebrow">MATTER 1.5 EVSE DEMO</p>
+      <h1>Configuration</h1>
+      <p class="muted">Manage data sources, API keys, and system settings</p>
+    </header>
+
+    <div class="config-container">
+      <div id="status-message"></div>
+
+      <!-- Price Source -->
+      <div class="config-section">
+        <h2>Price Source</h2>
+        <p class="help-text">Every dynamic tariff below is fetched hourly so its price history (and the price estimates) stay current. Choose which one the price server publishes to Matter devices; the charts follow the same choice.</p>
+        <div id="price-source-options" class="price-source-options">Loading price sources…</div>
+        <div class="button-group">
+          <button class="btn-primary" onclick="savePriceSource()">Save Price Source</button>
+        </div>
+      </div>
+
+      <!-- Grid Conditions Sources -->
+      <div class="config-section">
+        <h2>Grid Conditions Sources</h2>
+
+        <!-- UK Carbon Intensity -->
+        <div class="form-group">
+          <div class="toggle-group">
+            <input type="checkbox" id="uk-carbon-enabled" checked />
+            <label for="uk-carbon-enabled" style="margin: 0;">UK Carbon Intensity</label>
+          </div>
+          <label for="uk-postcode">Postcode (for regional data):</label>
+          <input type="text" id="uk-postcode" placeholder="e.g., SW1A 1AA (leave blank for national)" />
+          <p class="help-text">Data from <a href="https://carbonintensity.org" target="_blank">carbonintensity.org</a></p>
+        </div>
+
+        <!-- EU Carbon Intensity -->
+        <div class="form-group">
+          <div class="toggle-group">
+            <input type="checkbox" id="eu-carbon-enabled" />
+            <label for="eu-carbon-enabled" style="margin: 0;">EU Carbon Intensity (Coming Soon)</label>
+          </div>
+          <label for="eu-region">Region:</label>
+          <select id="eu-region" disabled>
+            <option value="de">Germany</option>
+            <option value="fr">France</option>
+            <option value="it">Italy</option>
+            <option value="es">Spain</option>
+            <option value="nl">Netherlands</option>
+          </select>
+          <p class="help-text">Multi-region EU data support coming soon</p>
+        </div>
+
+        <div class="button-group">
+          <button class="btn-primary" onclick="saveGridSources()">Save Grid Sources</button>
+        </div>
+      </div>
+
+      <!-- Custom Tariff -->
+      <div class="config-section">
+        <h2>Custom Time-of-Use Tariff</h2>
+        <p class="help-text">Saving a custom tariff selects it as the price source. Clearing it returns to the dynamic tariff used before.</p>
+
+        <div class="form-group">
+          <label for="tariff-name">Tariff Name:</label>
+          <input type="text" id="tariff-name" placeholder="e.g., Summer 2024 Off-Peak" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="tariff-currency">Currency:</label>
+            <select id="tariff-currency">
+              <option value="GBP">GBP (British Pounds)</option>
+              <option value="EUR">EUR (Euro)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Price Periods (price per kWh in pence or cents; each period runs until the next one starts, repeating daily):</label>
+          <div id="tariff-timeline" class="tariff-timeline" aria-label="Tariff over 24 hours"></div>
+          <div class="tariff-timeline-axis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          <div id="tariff-periods"></div>
+          <button class="btn-secondary" onclick="addTariffPeriod()">Add Period</button>
+        </div>
+
+        <div class="button-group">
+          <button class="btn-primary" onclick="saveCustomTariff()">Save Custom Tariff</button>
+          <button class="btn-secondary" onclick="clearCustomTariff()">Clear</button>
+        </div>
+      </div>
+
+      <!-- System Status -->
+      <div class="config-section">
+        <h2>System Status</h2>
+
+        <div id="fetcher-status" class="fetcher-status">
+          <p style="margin: 0; color: #666;">Loading fetcher status...</p>
+        </div>
+
+        <div class="cache-stats">
+          <div class="stat-box">
+            <div class="stat-value" id="cache-entries">—</div>
+            <div class="stat-label">Cache Entries</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value" id="cache-hit-rate">—</div>
+            <div class="stat-label">Hit Rate</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value" id="next-update">—</div>
+            <div class="stat-label">Next Update</div>
+          </div>
+        </div>
+
+        <div class="button-group" style="margin-top: 1.5rem;">
+          <button class="btn-primary" onclick="refreshSystemStatus()">Refresh Status</button>
+          <button class="btn-secondary" onclick="triggerAllFetches()">Trigger All Fetches</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/config.js" defer></script>
+  <script src="/version.js" defer></script>
+</body>
+</html>

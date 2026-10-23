@@ -9,6 +9,10 @@ const commissioningWindow = document.querySelector("#commissioning-window");
 const windowQrCode = document.querySelector("#window-qr-code");
 const windowManualCode = document.querySelector("#window-manual-code");
 const windowQrImage = document.querySelector("#window-qr-image");
+const commissionPriceServerButton = document.querySelector("#commission-price-server");
+const priceServerStatus = document.querySelector("#price-server-status");
+
+const ROLE_LABELS = { evse: "EVSE", "price-server": "Price server", unknown: "Other device" };
 
 document.querySelector("#commission-form").addEventListener("submit", async event => {
     event.preventDefault();
@@ -16,6 +20,40 @@ document.querySelector("#commission-form").addEventListener("submit", async even
     const discriminator = document.querySelector("#discriminator").value;
     await runAction("Commissioning device…", "/api/commission", { pairingCode, discriminator }, 201);
     event.target.reset();
+});
+
+commissionPriceServerButton.addEventListener("click", async () => {
+    commissionPriceServerButton.disabled = true;
+    priceServerStatus.textContent = "Commissioning price server…";
+    priceServerStatus.className = "";
+    try {
+        const response = await fetch("/api/commission-price-server", { method: "POST" });
+        const result = await response.json();
+        if (response.status !== 201) throw new Error(result.error ?? "Commissioning failed.");
+        priceServerStatus.textContent = result.status;
+        await Promise.all([loadNodes(), loadPriceServerPairing()]);
+    } catch (error) {
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    } finally {
+        commissionPriceServerButton.disabled = false;
+    }
+});
+
+document.querySelector("#reset-price-server").addEventListener("click", async () => {
+    if (!confirm("Factory reset the price server? Every controller it is commissioned to (including this one) will lose it, and EVSEs bound to it must be linked again.")) return;
+    priceServerStatus.textContent = "Resetting price server…";
+    priceServerStatus.className = "";
+    try {
+        const response = await fetch("/api/price-server-reset", { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error ?? "Reset failed.");
+        priceServerStatus.textContent = result.status;
+        await loadPriceServerPairing();
+    } catch (error) {
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    }
 });
 
 document.querySelector("#refresh").addEventListener("click", loadNodes);
@@ -65,7 +103,7 @@ function renderDiscoveredDevice(device) {
     const name = document.createElement("span");
     name.textContent = device.deviceName ?? device.id;
     const details = document.createElement("small");
-    details.textContent = `Long discriminator: ${device.discriminator}`;
+    details.textContent = `${ROLE_LABELS[device.role]} · Long discriminator: ${device.discriminator}`;
     const select = document.createElement("button");
     select.className = "secondary";
     select.textContent = "Use discriminator";
@@ -79,12 +117,47 @@ function renderDiscoveredDevice(device) {
 
 function renderNode(node) {
     const item = document.createElement("li");
-    item.innerHTML = `<code>${node.nodeId}</code>`;
+    item.className = "node-row";
+    const info = document.createElement("div");
+    info.className = "node-info";
+    if (node.nodeName) {
+        const name = document.createElement("span");
+        name.className = "node-name";
+        name.textContent = node.nodeName;
+        info.append(name);
+    }
+    const id = document.createElement("code");
+    id.textContent = displayNodeId(node.nodeId);
+    const details = document.createElement("small");
+    details.textContent = [ROLE_LABELS[node.role], node.productName].filter(Boolean).join(" · ");
+    details.title = details.textContent;
+    info.append(id, details);
+
+    // Every row fills the same button columns (an empty slot where a button doesn't apply) so they line up
+    let link = document.createElement("span");
+    if (node.consumesPrices) {
+        link = document.createElement("button");
+        link.className = "secondary";
+        link.textContent = "Link to price server";
+        link.addEventListener("click", async () => {
+            await runAction("Linking device to price server…", `/api/nodes/${node.nodeId}/link-price-server`);
+        });
+    }
+
+    let timeSource = document.createElement("span");
+    if (node.supportsTrustedTimeSource) {
+        timeSource = document.createElement("button");
+        timeSource.className = "secondary";
+        timeSource.textContent = "Set trusted time source";
+        timeSource.addEventListener("click", async () => {
+            await runAction("Setting trusted time source…", `/api/nodes/${node.nodeId}/set-time-source`);
+        });
+    }
 
     const decommission = document.createElement("button");
     decommission.textContent = "Decommission";
     decommission.addEventListener("click", async () => {
-        if (!confirm(`Decommission ${node.nodeId} from this Matter fabric?`)) return;
+        if (!confirm(`Decommission ${nodeDisplayName(node)} from this Matter fabric?`)) return;
         await runAction("Decommissioning device…", `/api/nodes/${node.nodeId}/decommission`);
     });
 
@@ -99,12 +172,16 @@ function renderNode(node) {
     forget.className = "secondary";
     forget.textContent = "Force forget";
     forget.addEventListener("click", async () => {
-        if (!confirm(`Forget ${node.nodeId} locally? The device will retain this Matter fabric.`)) return;
+        if (!confirm(`Forget ${nodeDisplayName(node)} locally? The device will retain this Matter fabric.`)) return;
         await runAction("Forgetting device locally…", `/api/nodes/${node.nodeId}/force-forget`);
     });
 
-    item.append(openWindow, decommission, forget);
+    item.append(info, link, timeSource, openWindow, decommission, forget);
     return item;
+}
+
+function nodeDisplayName(node) {
+    return node.nodeName ? `${node.nodeName} (${displayNodeId(node.nodeId)})` : `node ${displayNodeId(node.nodeId)}`;
 }
 
 async function openCommissioningWindow(nodeId) {
@@ -137,10 +214,15 @@ async function runAction(pendingMessage, url, body, expectedStatus = 200) {
         const result = await response.json();
         if (response.status !== expectedStatus) throw new Error(result.error ?? "Request failed.");
         showStatus(result.status ?? "Done.");
-        await loadNodes();
+        await Promise.all([loadNodes(), loadPriceServerPairing()]);
     } catch (error) {
         showStatus(error.message, true);
     }
+}
+
+/** Node IDs are shown in hex, as in Matter tooling (the API still uses decimal) */
+function displayNodeId(nodeId) {
+    return `0x${BigInt(nodeId).toString(16).toUpperCase().padStart(4, "0")}`;
 }
 
 function showStatus(message, isError = false) {
@@ -153,4 +235,29 @@ function showDiscoveryStatus(message, isError = false) {
     discoveryStatus.className = isError ? "error" : "";
 }
 
+async function loadPriceServerPairing() {
+    try {
+        const response = await fetch("/api/price-server-pairing");
+        const { pairing, error } = await response.json();
+        if (!response.ok) throw new Error(error ?? "Price server unavailable.");
+        document.querySelector("#price-server-qr").innerHTML = pairing.qrSvg ?? "";
+        document.querySelector("#price-server-manual-code").textContent = pairing.manualPairingCode ?? "—";
+        document.querySelector("#price-server-pin").textContent = `${pairing.passcode} / ${pairing.discriminator}`;
+        commissionPriceServerButton.disabled = pairing.commissioned;
+        if (pairing.onThisController) {
+            priceServerStatus.textContent = "The price server is commissioned on this controller.";
+        } else if (pairing.commissioned) {
+            priceServerStatus.textContent =
+                "The price server is commissioned by another controller, so it isn't discoverable. Reset it, or open a commissioning window from that controller.";
+        } else {
+            priceServerStatus.textContent = "";
+        }
+    } catch (error) {
+        commissionPriceServerButton.disabled = true;
+        priceServerStatus.textContent = error.message;
+        priceServerStatus.className = "error";
+    }
+}
+
 loadNodes();
+loadPriceServerPairing();

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Price & Grid Forecast | Matter EVSE Demo</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+  <style>
+    .dashboard {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 2rem;
+      padding: 2rem;
+    }
+
+    .card {
+      background: white;
+      border-radius: 8px;
+      padding: 1.5rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.25rem;
+      color: #333;
+    }
+
+    .current-value {
+      font-size: 2rem;
+      font-weight: bold;
+      margin: 1rem 0;
+      padding: 1rem;
+      background: #f5f5f5;
+      border-radius: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .level-indicator {
+      display: inline-block;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      margin-left: 1rem;
+    }
+
+    .level-very-low { background-color: #00a651; }
+    .level-low { background-color: #7cb342; }
+    .level-medium { background-color: #fbc02d; }
+    .level-high { background-color: #f57c00; }
+    .level-very-high { background-color: #d32f2f; }
+
+    .chart-container {
+      position: relative;
+      height: 300px;
+      margin-top: 1.5rem;
+    }
+
+    .metadata {
+      font-size: 0.875rem;
+      color: #666;
+      margin-top: 1rem;
+      padding-top: 1rem;
+      border-top: 1px solid #eee;
+    }
+
+    .status-badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: bold;
+      margin-right: 0.5rem;
+    }
+
+    .status-fresh { background: #c8e6c9; color: #1b5e20; }
+    .status-acceptable { background: #fff9c4; color: #f57f17; }
+    .status-stale { background: #ffccbc; color: #bf360c; }
+    .status-expired { background: #ffcdd2; color: #b71c1c; }
+
+    .controls {
+      display: flex;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    button {
+      padding: 0.5rem 1rem;
+      background: #1976d2;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.875rem;
+    }
+
+    button:hover {
+      background: #1565c0;
+    }
+
+    .error {
+      background: #ffebee;
+      color: #c62828;
+      padding: 1rem;
+      border-radius: 4px;
+      margin: 1rem 0;
+    }
+
+    .loading {
+      text-align: center;
+      color: #666;
+      padding: 2rem;
+    }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Adectio home">
+      <img src="/assets/adectio-logo.png" alt="Adectio" width="150" height="46" />
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="/">Admin</a>
+      <a href="/evse.html">EVSE</a>
+      <a href="/charging-preferences.html">Charging preferences</a>
+      <a class="active" href="/price-forecast.html">Price & Grid Forecast</a>
+      <a href="/config.html">Configuration</a>
+    </nav>
+  </aside>
+
+  <main>
+    <header>
+      <p class="eyebrow">MATTER 1.5 EVSE DEMO</p>
+      <h1>Price & Grid Forecast</h1>
+      <p class="muted">Real-time commodity pricing and grid carbon intensity forecasts</p>
+    </header>
+
+    <div class="dashboard">
+      <!-- Commodity Price Card -->
+      <div class="card">
+        <h2>Commodity Price</h2>
+
+        <div id="price-error" class="error" style="display: none;"></div>
+        <div id="price-loading" class="loading" style="display: none;">Loading price data...</div>
+
+        <div id="price-content" style="display: none;">
+          <div class="current-value">
+            <span id="current-price">—</span>
+            <span id="current-price-level" class="level-indicator"></span>
+          </div>
+
+          <div class="chart-container">
+            <canvas id="priceChart"></canvas>
+          </div>
+          <p id="price-estimate-note" class="muted" hidden></p>
+
+          <div class="metadata">
+            <p><strong>Source:</strong> <span id="price-source">—</span> <a href="/config.html">(change)</a></p>
+            <p><strong>Currency:</strong> <span id="price-currency">GBP</span></p>
+            <p><strong>Tariff Unit:</strong> <span id="price-unit">kWh</span></p>
+            <p><strong>Period:</strong> <span id="price-period">30 minutes</span></p>
+            <p><strong>Data Age:</strong> <span id="price-age">—</span></p>
+            <p><strong>Cache Status:</strong> <span id="price-status" class="status-badge">—</span></p>
+            <div class="controls">
+              <button onclick="refreshPrice()">Refresh</button>
+              <button onclick="exportData('price')">Export</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Grid Conditions Card -->
+      <div class="card">
+        <h2>Grid Carbon Intensity</h2>
+
+        <div id="grid-error" class="error" style="display: none;"></div>
+        <div id="grid-loading" class="loading" style="display: none;">Loading grid data...</div>
+
+        <div id="grid-content" style="display: none;">
+          <div class="current-value">
+            <span id="current-intensity">—</span>
+            <span id="current-intensity-level" class="level-indicator"></span>
+          </div>
+
+          <div class="chart-container">
+            <canvas id="gridChart"></canvas>
+          </div>
+
+          <div class="metadata">
+            <p><strong>Region:</strong> <span id="grid-region">UK</span></p>
+            <p><strong>Postcode:</strong> <span id="grid-postcode">National</span></p>
+            <p><strong>Unit:</strong> gCO2/kWh</p>
+            <p><strong>Data Age:</strong> <span id="grid-age">—</span></p>
+            <p><strong>Cache Status:</strong> <span id="grid-status" class="status-badge">—</span></p>
+            <div class="controls">
+              <button onclick="refreshGrid()">Refresh</button>
+              <button onclick="exportData('grid')">Export</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/price-forecast.js" defer></script>
+  <script src="/version.js" defer></script>
+</body>
+</html>

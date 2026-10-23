@@ -1,15 +1,50 @@
+import "dotenv/config";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
+import { TimeoutError } from "@matter/main";
 import QRCode from "qrcode";
 import { MatterControllerService } from "./matter-controller.js";
+import { handleApiRequest } from "./api/handler.js";
+import { initializeDatabase, closeDatabase } from "./database/schema.js";
+import { initializeRedis, closeRedis } from "./database/cache.js";
+import { initializeScheduler, stopScheduler } from "./fetchers/scheduler.js";
+import { initializePriceServer, PRICE_SERVER_DISCRIMINATOR, PRICE_SERVER_PASSCODE } from "./price-server/index.js";
 
 const port = Number(process.env.PORT ?? 3000);
+const host = process.env.HOST ?? "0.0.0.0";
 const publicDirectory = join(process.cwd(), "public");
 const controller = new MatterControllerService();
+let priceServer: any = null;
+const versions = await readVersions();
 
 assertNodeVersion();
 await controller.start();
+
+// Initialize data fetching infrastructure first (so price server has data)
+try {
+  console.log("Initializing database...");
+  await initializeDatabase();
+  console.log("Initializing Redis...");
+  await initializeRedis();
+  console.log("Starting data fetcher scheduler...");
+  await initializeScheduler();
+} catch (error) {
+  console.warn("Failed to initialize data fetching:", error);
+}
+
+// Initialize price server after fetchers (so it has data available)
+try {
+  console.log("Initializing price server...");
+  priceServer = await initializePriceServer();
+
+  // Register price server with fetchers for updates
+  if ((globalThis as any).__priceServer === undefined) {
+    (globalThis as any).__priceServer = priceServer;
+  }
+} catch (error) {
+  console.warn("Failed to initialize price server:", error);
+}
 
 const server = createServer(async (request, response) => {
     try {
@@ -21,14 +56,19 @@ const server = createServer(async (request, response) => {
     }
 });
 
-server.listen(port, "127.0.0.1", () => {
-    console.log(`Matter EVSE demo is available at http://127.0.0.1:${port}`);
+server.listen(port, host, () => {
+    console.log(`Matter EVSE demo is listening on http://${host}:${port}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-        server.close(() => {
-            controller.close().finally(() => process.exit(0));
+    process.on(signal, async () => {
+        server.close(async () => {
+            if (priceServer) await priceServer.stop();
+            await stopScheduler();
+            await closeRedis();
+            await closeDatabase();
+            await controller.close();
+            process.exit(0);
         });
     });
 }
@@ -36,13 +76,48 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 async function handleRequest(request: IncomingMessage, response: ServerResponse) {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
 
+    // Try price server API first
+    if (priceServer && url.pathname.startsWith("/api/price-server/")) {
+        try {
+            const body = request.method === "POST" ? await readJson(request) : undefined;
+            const handler = priceServer.getAPIHandler();
+            const result = await handler(url.pathname, request.method ?? "GET", body);
+            if (result.handled) {
+                return sendJson(response, result.statusCode || 200, result.response);
+            }
+        } catch (error) {
+            console.error("Price server API error:", error);
+            return sendJson(response, 500, { error: (error as Error).message });
+        }
+    }
+
+    // Try existing API handler
+    try {
+        const handled = await handleApiRequest(url.pathname, request.method ?? "GET", url, response);
+        if (handled) return;
+    } catch (error) {
+        console.error("API handler error:", error);
+        sendJson(response, 500, { error: (error as Error).message });
+        return;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/health") {
         sendJson(response, 200, { status: "ready" });
         return;
     }
 
+    if (request.method === "GET" && url.pathname === "/api/version") {
+        sendJson(response, 200, versions);
+        return;
+    }
+
+    if (url.pathname.startsWith("/api/companion/")) {
+        await handleCompanionRequest(request, response, url);
+        return;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/nodes") {
-        sendJson(response, 200, { nodes: controller.listNodes() });
+        sendJson(response, 200, { nodes: await controller.listNodes() });
         return;
     }
 
@@ -122,7 +197,61 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
             requiredString(body.pairingCode, "pairingCode"),
             optionalString(body.discriminator),
         );
-        sendJson(response, 201, { node });
+        sendJson(response, 201, { node, status: commissionedStatus(node) });
+        return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/price-server-pairing") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        const pairing = priceServer.getPairingInfo();
+        const onThisController = (await controller.listNodes()).some(node => node.role === "price-server");
+        sendJson(response, 200, {
+            pairing: {
+                ...pairing,
+                onThisController,
+                qrSvg: pairing.qrPairingCode
+                    ? await QRCode.toString(pairing.qrPairingCode, { errorCorrectionLevel: "M", margin: 1, type: "svg", width: 192 })
+                    : undefined,
+            },
+        });
+        return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/commission-price-server") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        // A commissioned node stops advertising, so discovery would just time out
+        if (priceServer.getPairingInfo().commissioned) {
+            const onThisController = (await controller.listNodes()).some(node => node.role === "price-server");
+            sendJson(response, 409, {
+                error: onThisController
+                    ? "The price server is already commissioned on this controller."
+                    : "The price server is already commissioned by another controller, so it isn't discoverable. Reset it here, or open a commissioning window from that controller and use its pairing code.",
+            });
+            return;
+        }
+        // Use the price server's own (distinct) passcode and discriminator so an EVSE can never be picked up instead
+        const node = await controller.commission(
+            String(PRICE_SERVER_PASSCODE),
+            String(PRICE_SERVER_DISCRIMINATOR),
+            "price-server",
+        );
+        sendJson(response, 201, { node, status: commissionedStatus(node) });
+        return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/price-server-reset") {
+        if (!priceServer) {
+            sendJson(response, 503, { error: "The local price server is not running." });
+            return;
+        }
+        await priceServer.factoryReset();
+        sendJson(response, 200, { status: "Price server reset to factory defaults; it is commissionable again." });
         return;
     }
 
@@ -132,10 +261,15 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
         return;
     }
 
-    const nodeAction = /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window)$/.exec(url.pathname);
+    const nodeAction =
+        /^\/api\/nodes\/(\d+)\/(decommission|force-forget|open-commissioning-window|link-price-server|set-time-source)$/.exec(url.pathname);
     if (request.method === "POST" && nodeAction !== null) {
         const [, nodeId, action] = nodeAction;
-        if (action === "decommission") {
+        if (action === "link-price-server") {
+            sendJson(response, 200, { status: await controller.linkPriceConsumer(nodeId) });
+        } else if (action === "set-time-source") {
+            sendJson(response, 200, { status: await controller.setTrustedTimeSource(nodeId) });
+        } else if (action === "decommission") {
             await controller.decommission(nodeId);
             sendJson(response, 200, {
                 status: "Remote fabric removal completed. The device has been decommissioned.",
@@ -163,6 +297,48 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
     if (request.method === "GET") {
         await serveStaticFile(url.pathname, response);
+        return;
+    }
+
+    sendJson(response, 404, { error: "Not found" });
+}
+
+/** REST API used by the MCC iOS companion app (github.com/tomasmcguinness/matter-controller-companion-app). */
+async function handleCompanionRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
+    if (request.method === "GET" && url.pathname === "/api/companion/info") {
+        sendJson(response, 200, { name: "Matter EVSE Demo" });
+        return;
+    }
+
+    if (url.pathname === "/api/companion/nodes") {
+        if (request.method === "GET") {
+            sendJson(response, 200, await controller.listCompanionNodes());
+            return;
+        }
+        if (request.method === "POST") {
+            const body = await readJson(request);
+            try {
+                const node = await controller.commission(requiredString(body.setupCode, "setupCode"));
+                sendJson(response, 201, { nodeId: Number(node.nodeId) });
+            } catch (error) {
+                if (!(error instanceof TimeoutError)) throw error;
+                sendJson(response, 504, { error: error.message });
+            }
+            return;
+        }
+    }
+
+    const renameAction = /^\/api\/companion\/nodes\/(\d+)\/update$/.exec(url.pathname);
+    if (request.method === "PUT" && renameAction !== null) {
+        const body = await readJson(request);
+        sendJson(response, 200, { status: await controller.renameNode(renameAction[1], requiredString(body.name, "name")) });
+        return;
+    }
+
+    const nodeAction = /^\/api\/companion\/nodes\/(\d+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && nodeAction !== null) {
+        await controller.decommission(nodeAction[1]);
+        sendJson(response, 200, { status: "Remote fabric removal completed. The device has been decommissioned." });
         return;
     }
 
@@ -206,6 +382,13 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
     }
 }
 
+function commissionedStatus(node: { nodeId: string; role: string; productName?: string; linkStatus?: string }) {
+    const label = { evse: "EVSE", "price-server": "price server", unknown: "device" }[node.role] ?? "device";
+    const name = node.productName ? ` (${node.productName})` : "";
+    const nodeId = `0x${BigInt(node.nodeId).toString(16).toUpperCase().padStart(4, "0")}`;
+    return [`Commissioned ${label} ${nodeId}${name}.`, node.linkStatus].filter(Boolean).join(" ");
+}
+
 function requiredString(value: unknown, name: string) {
     if (typeof value !== "string" || value.trim().length === 0) {
         throw new Error(`"${name}" is required.`);
@@ -236,8 +419,9 @@ function requiredChargingTargets(value: unknown) {
         const departureMinutes = requiredInteger(record.departureMinutes, `targets[${index}].departureMinutes`, 0, 1439);
         const targetSoC = optionalInteger(record.targetSoC, `targets[${index}].targetSoC`, 0, 100);
         const addedEnergy = optionalPositiveNumber(record.addedEnergy, `targets[${index}].addedEnergy`);
-        if ((targetSoC === undefined) === (addedEnergy === undefined)) {
-            throw new Error(`Target ${index + 1} must specify exactly one of targetSoC or addedEnergy.`);
+        // Both may be given: with SoC reporting, AddedEnergy is the fallback when the EV doesn't report its SoC
+        if (targetSoC === undefined && addedEnergy === undefined) {
+            throw new Error(`Target ${index + 1} must specify targetSoC and/or addedEnergy.`);
         }
         return { departureMinutes, targetSoC, addedEnergy };
     });
@@ -276,6 +460,21 @@ function requiredNonNegativeChargeCurrent(value: unknown, name: string) {
         throw new Error(`"${name}" must not be negative.`);
     }
     return current;
+}
+
+/** The app and matter.js versions, shown in the sidebar (@matter/main doesn't export its package.json) */
+async function readVersions() {
+    const versionOf = async (path: string) => {
+        try {
+            return (JSON.parse(await readFile(join(process.cwd(), path), "utf8")) as { version?: string }).version ?? null;
+        } catch {
+            return null;
+        }
+    };
+    return {
+        app: await versionOf("package.json"),
+        matterJs: await versionOf("node_modules/@matter/main/package.json"),
+    };
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
